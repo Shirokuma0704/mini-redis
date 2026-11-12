@@ -16,7 +16,7 @@ from mini_redis.persistence.aof import (
 )
 
 
-# 항목 1: 다섯 가지 레코드가 인코딩 후 디코딩해도 그대로 돌아온다
+# 다섯 가지 레코드가 인코딩 후 디코딩해도 그대로 돌아온다
 @pytest.mark.parametrize(
     "record",
     [
@@ -33,13 +33,13 @@ def test_record_encode_then_decode_round_trips_unchanged(record):
     assert decode_line(line) == record
 
 
-# 항목 2: 명세의 set 예시와 글자까지 똑같다
+# 명세의 set 예시와 글자까지 똑같다
 def test_encode_set_record_matches_spec_example_exactly():
     line = encode_record(set_record("user:v3:42", "...", 1762934400000))
     assert line == '{"op":"set","k":"user:v3:42","v":"...","exp":1762934400000}\n'
 
 
-# 항목 3: 나머지 네 가지 모양의 정확한 텍스트
+# 나머지 네 가지 모양의 정확한 텍스트
 def test_encode_del_record_has_exact_text():
     assert encode_record(del_record("a")) == '{"op":"del","k":"a"}\n'
 
@@ -56,14 +56,14 @@ def test_encode_ns_version_record_has_exact_text():
     assert encode_record(ns_version_record("user", 7)) == '{"op":"nsver","ns":"user","ver":7}\n'
 
 
-# 항목 4: TTL 없는 SET은 "exp":null 로 적히고 None 으로 돌아온다
+# TTL 없는 SET은 "exp":null 로 적히고 None 으로 돌아온다
 def test_encode_set_record_without_ttl_writes_null_and_decodes_to_none():
     line = encode_record(set_record("a", "1"))
     assert '"exp":null' in line
     assert decode_line(line)["exp"] is None
 
 
-# 항목 5: 줄바꿈, 따옴표, 역슬래시가 들어간 값도 정확히 한 줄이고 그대로 돌아온다
+# 줄바꿈, 따옴표, 역슬래시가 들어간 값도 정확히 한 줄이고 그대로 돌아온다
 def test_encode_set_record_with_special_characters_stays_one_line_and_round_trips():
     value = 'a\nb\rc"d\\e'
     record = set_record("k", value, None)
@@ -74,7 +74,7 @@ def test_encode_set_record_with_special_characters_stays_one_line_and_round_trip
     assert decode_line(line) == record
 
 
-# 항목 6: 한글 키와 값은 이스케이프 없이 그대로 적히고 그대로 돌아온다
+# 한글 키와 값은 이스케이프 없이 그대로 적히고 그대로 돌아온다
 def test_encode_set_record_with_korean_text_is_unescaped_and_round_trips():
     record = set_record("세션:상철", "안녕", None)
     line = encode_record(record)
@@ -83,14 +83,14 @@ def test_encode_set_record_with_korean_text_is_unescaped_and_round_trips():
     assert decode_line(line) == record
 
 
-# 항목 7: 빈 문자열 값은 None 이 아니라 빈 문자열로 돌아온다
+# 빈 문자열 값은 None 이 아니라 빈 문자열로 돌아온다
 def test_set_record_with_empty_string_value_round_trips_as_empty_string():
     decoded = decode_line(encode_record(set_record("a", "", None)))
     assert decoded["v"] == ""
     assert decoded["v"] is not None
 
 
-# 항목 8: 끝의 줄바꿈이 없어도, "\r\n" 이어도 읽힌다
+# 끝의 줄바꿈이 없어도, "\r\n" 이어도 읽힌다
 def test_decode_line_without_trailing_newline_works():
     assert decode_line('{"op":"del","k":"a"}') == {"op": "del", "k": "a"}
 
@@ -99,7 +99,7 @@ def test_decode_line_with_crlf_ending_works():
     assert decode_line('{"op":"del","k":"a"}\r\n') == {"op": "del", "k": "a"}
 
 
-# 항목 9: 깨졌거나 모양이 틀린 줄은 ValueError
+# 깨졌거나 모양이 틀린 줄은 ValueError
 @pytest.mark.parametrize(
     "bad_line",
     [
@@ -133,7 +133,7 @@ def test_decode_line_with_bad_line_raises_value_error(bad_line):
         decode_line(bad_line)
 
 
-# 항목 10: TTL이 있는 SET의 exp 는 호출한 쪽이 계산한 절대 시각 그대로다
+# TTL이 있는 SET의 exp 는 호출한 쪽이 계산한 절대 시각 그대로다
 def test_set_record_with_ttl_keeps_absolute_expire_time_unchanged():
     now = 1_000_000
     ttl_seconds = 10

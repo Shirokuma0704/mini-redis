@@ -22,9 +22,9 @@ from mini_redis.persistence.aof import (
 
 HUGE_INTERVAL_S = 3600
 
-# CP1 표: 가짜 now = 1_000_000
+# 예시 레코드: 가짜 now = 1_000_000
 NOW_MS = 1_000_000
-CP1_RECORDS = [
+SAMPLE_RECORDS = [
     set_record("a", "1", None),
     set_record("b", "2", NOW_MS + 10_000),
     del_record("a"),
@@ -39,37 +39,33 @@ def read_lines(path):
     return path.read_bytes().decode("utf-8").splitlines()
 
 
-# 항목 1
 def test_AofWriter_생성만_하면_파일을_만들지_않는다(tmp_path):
     path = tmp_path / "appendonly.aof"
     AofWriter(path)
     assert not path.exists()
 
 
-# 항목 2
 def test_append_세_번_불러도_파일은_아직_없다(tmp_path):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
-    for record in CP1_RECORDS:
+    for record in SAMPLE_RECORDS:
         writer.append(record)
     assert not path.exists()
 
 
-# 항목 3
 def test_flush_한_번이면_세_줄이_순서대로_파일에_적히고_3을_돌려준다(tmp_path):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
-    for record in CP1_RECORDS:
+    for record in SAMPLE_RECORDS:
         writer.append(record)
     assert writer.flush() == 3
-    assert path.read_bytes() == expected_bytes(CP1_RECORDS)
+    assert path.read_bytes() == expected_bytes(SAMPLE_RECORDS)
 
 
-# 항목 4
 def test_flush_추가된_줄이_없으면_0을_돌려주고_파일이_그대로다(tmp_path):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
-    for record in CP1_RECORDS:
+    for record in SAMPLE_RECORDS:
         writer.append(record)
     writer.flush()
     before = path.read_bytes()
@@ -79,23 +75,21 @@ def test_flush_추가된_줄이_없으면_0을_돌려주고_파일이_그대로�
     assert path.stat().st_size == size_before
 
 
-# 항목 5
 def test_flush_두_번_나눠_해도_모든_줄이_순서대로_남는다(tmp_path):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
-    writer.append(CP1_RECORDS[0])
-    writer.append(CP1_RECORDS[1])
+    writer.append(SAMPLE_RECORDS[0])
+    writer.append(SAMPLE_RECORDS[1])
     writer.flush()
-    writer.append(CP1_RECORDS[2])
+    writer.append(SAMPLE_RECORDS[2])
     writer.flush()
-    assert path.read_bytes() == expected_bytes(CP1_RECORDS)
+    assert path.read_bytes() == expected_bytes(SAMPLE_RECORDS)
 
 
-# 항목 6
 def test_파일_내용은_줄바꿈이_LF뿐이고_CRLF가_없다(tmp_path):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
-    for record in CP1_RECORDS:
+    for record in SAMPLE_RECORDS:
         writer.append(record)
     writer.flush()
     raw = path.read_bytes()
@@ -103,7 +97,6 @@ def test_파일_내용은_줄바꿈이_LF뿐이고_CRLF가_없다(tmp_path):
     assert raw.count(b"\n") == 3
 
 
-# 항목 7
 def test_한글_값은_UTF8로_적히고_디코딩하면_되돌아온다(tmp_path):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
@@ -115,40 +108,36 @@ def test_한글_값은_UTF8로_적히고_디코딩하면_되돌아온다(tmp_pat
     assert [decode_line(line) for line in text.splitlines()] == records
 
 
-# 항목 8
 def test_파일의_줄을_디코딩하면_append한_레코드와_같다(tmp_path):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
-    for record in CP1_RECORDS:
+    for record in SAMPLE_RECORDS:
         writer.append(record)
     writer.flush()
-    assert [decode_line(line) for line in read_lines(path)] == CP1_RECORDS
+    assert [decode_line(line) for line in read_lines(path)] == SAMPLE_RECORDS
 
 
-# 항목 9
 def test_start_append_stop_이면_줄이_파일에_있고_스레드가_끝난다(tmp_path):
     path = tmp_path / "appendonly.aof"
     threads_before = threading.active_count()
     writer = AofWriter(path, interval_s=HUGE_INTERVAL_S)
     writer.start()
     assert threading.active_count() == threads_before + 1
-    writer.append(CP1_RECORDS[0])
+    writer.append(SAMPLE_RECORDS[0])
     writer.stop()
-    assert path.read_bytes() == expected_bytes([CP1_RECORDS[0]])
+    assert path.read_bytes() == expected_bytes([SAMPLE_RECORDS[0]])
     assert threading.active_count() == threads_before
 
 
-# 항목 10
 def test_stop_start_없이_불러도_남은_줄을_flush하고_예외가_없다(tmp_path):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path, interval_s=HUGE_INTERVAL_S)
-    for record in CP1_RECORDS:
+    for record in SAMPLE_RECORDS:
         writer.append(record)
     writer.stop()
-    assert path.read_bytes() == expected_bytes(CP1_RECORDS)
+    assert path.read_bytes() == expected_bytes(SAMPLE_RECORDS)
 
 
-# 항목 11
 def test_start_두_번_불러도_스레드는_하나고_stop_뒤_원래_개수로_돌아온다(tmp_path):
     path = tmp_path / "appendonly.aof"
     threads_before = threading.active_count()
@@ -160,7 +149,6 @@ def test_start_두_번_불러도_스레드는_하나고_stop_뒤_원래_개수�
     assert threading.active_count() == threads_before
 
 
-# 항목 12
 def test_여러_스레드가_append하며_flush해도_1000줄이_스레드별_순서대로_남는다(tmp_path):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
@@ -192,7 +180,6 @@ def test_여러_스레드가_append하며_flush해도_1000줄이_스레드별_�
         assert seen[t] == list(range(per_thread))
 
 
-# 항목 13
 def test_flush_open이_한_번_실패하면_줄이_버퍼에_남아_다음_flush에_순서대로_적힌다(tmp_path, monkeypatch):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
@@ -223,7 +210,6 @@ def test_flush_open이_한_번_실패하면_줄이_버퍼에_남아_다음_flush
     assert writer.last_error is None
 
 
-# 항목 14
 def test_flush_fsync가_쓰기_뒤에_실패해도_다음_flush에_각_줄이_정확히_한_번씩만_남는다(tmp_path, monkeypatch):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
@@ -253,7 +239,6 @@ def test_flush_fsync가_쓰기_뒤에_실패해도_다음_flush에_각_줄이_�
     assert writer.last_error is None
 
 
-# 항목 15
 def test_stop_flush가_실패한_뒤에_불러도_실패했던_줄이_파일에_남는다(tmp_path, monkeypatch):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path, interval_s=HUGE_INTERVAL_S)
@@ -277,7 +262,6 @@ def test_stop_flush가_실패한_뒤에_불러도_실패했던_줄이_파일에_
     assert path.read_bytes() == expected_bytes([record])
 
 
-# 항목 16
 def test_flush_fsync가_정말_불리고_빈_flush는_더_부르지_않는다(tmp_path, monkeypatch):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
@@ -289,14 +273,13 @@ def test_flush_fsync가_정말_불리고_빈_flush는_더_부르지_않는다(tm
         return real_fsync(fd)
 
     monkeypatch.setattr(aof_module.os, "fsync", counting_fsync)
-    writer.append(CP1_RECORDS[0])
+    writer.append(SAMPLE_RECORDS[0])
     assert writer.flush() == 1
     assert len(calls) == 1
     assert writer.flush() == 0
     assert len(calls) == 1
 
 
-# 항목 17
 def test_stop_없이도_interval마다_flush가_돌아_줄이_파일에_적힌다(tmp_path, monkeypatch):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path, interval_s=0.01)
@@ -308,17 +291,16 @@ def test_stop_없이도_interval마다_flush가_돌아_줄이_파일에_적힌�
         done.set()
 
     monkeypatch.setattr(aof_module.os, "fsync", signaling_fsync)
-    writer.append(CP1_RECORDS[0])
+    writer.append(SAMPLE_RECORDS[0])
     writer.start()
     try:
         assert done.wait(5) is True
-        assert path.read_bytes() == expected_bytes([CP1_RECORDS[0]])
+        assert path.read_bytes() == expected_bytes([SAMPLE_RECORDS[0]])
         assert writer._thread.is_alive()
     finally:
         writer.stop()
 
 
-# 항목 18
 def test_백그라운드_스레드는_flush가_실패해도_살아남아_다음_주기에_줄을_적는다(tmp_path, monkeypatch):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path, interval_s=0.01)
@@ -334,17 +316,16 @@ def test_백그라운드_스레드는_flush가_실패해도_살아남아_다음_
         done.set()
 
     monkeypatch.setattr(aof_module.os, "fsync", flaky_fsync)
-    writer.append(CP1_RECORDS[0])
+    writer.append(SAMPLE_RECORDS[0])
     writer.start()
     try:
         assert done.wait(5) is True
         assert writer._thread.is_alive()
-        assert path.read_bytes() == expected_bytes([CP1_RECORDS[0]])
+        assert path.read_bytes() == expected_bytes([SAMPLE_RECORDS[0]])
     finally:
         writer.stop()
 
 
-# 항목 19
 def test_flush_한_쪽이_쓰기_락_안에서_멈춰_있어도_1000줄이_스레드별_순서대로_남는다(tmp_path, monkeypatch):
     # 한 flush가 fsync에서 멈춘 동안(=쓰기 락을 쥔 채) 다른 스레드가 append·flush를 계속해도
     # 줄이 섞이거나 사라지지 않는지 봐요. 멈추는 지점은 Event로 고정해서 sleep이 필요 없어요.
@@ -425,7 +406,6 @@ def test_flush_한_쪽이_쓰기_락_안에서_멈춰_있어도_1000줄이_스�
         assert seen[t] == list(range(2 * half))
 
 
-# 항목 20
 def test_append_인코딩할_수_없는_값은_예외를_내고_앞서_넣은_줄은_잃지_않는다(tmp_path):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
@@ -499,7 +479,6 @@ def _make_broken_writer(path, monkeypatch, interval_s=HUGE_INTERVAL_S):
     return writer, raised, fsync_error, truncate_error
 
 
-# 항목 21
 def test_flush_되돌리기까지_실패하면_broken이_되고_원래_예외와_되돌리기_예외를_따로_남긴다(tmp_path, monkeypatch):
     path = tmp_path / "appendonly.aof"
     writer, raised, fsync_error, truncate_error = _make_broken_writer(path, monkeypatch)
@@ -509,7 +488,6 @@ def test_flush_되돌리기까지_실패하면_broken이_되고_원래_예외와
     assert writer.rollback_error is truncate_error
 
 
-# 항목 22
 def test_broken_writer는_flush가_파일을_열지_않고_AofBrokenError를_내며_append도_막는다(tmp_path, monkeypatch):
     path = tmp_path / "appendonly.aof"
     writer, _, _, _ = _make_broken_writer(path, monkeypatch)
@@ -539,7 +517,6 @@ def test_broken_writer는_flush가_파일을_열지_않고_AofBrokenError를_내
     assert append_raised is not None
 
 
-# 항목 23
 def test_broken_writer의_백그라운드_스레드는_예외를_삼키고_살아있다가_stop에서_AofBrokenError를_낸다(tmp_path, monkeypatch):
     path = tmp_path / "appendonly.aof"
     writer, _, _, _ = _make_broken_writer(path, monkeypatch, interval_s=0.01)
@@ -570,7 +547,6 @@ def test_broken_writer의_백그라운드_스레드는_예외를_삼키고_살�
     assert not thread.is_alive()
 
 
-# 항목 24
 def test_flush_되돌리기가_성공한_실패는_broken이_아니고_다음_flush에_각_줄이_한_번씩만_남는다(tmp_path, monkeypatch):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
@@ -634,7 +610,6 @@ class _EverythingFailsFile:
         return False
 
 
-# 항목 25
 def test_flush_쓰기_되돌리기_닫기가_모두_실패해도_처음_쓰기_예외가_올라오고_들고_나간_줄은_버퍼에_남는다(tmp_path, monkeypatch):
     # close 예외가 with의 __exit__에서 먼저 터져도 처음 실패(A)가 가려지면 안 돼요.
     path = tmp_path / "appendonly.aof"
@@ -661,11 +636,10 @@ def test_flush_쓰기_되돌리기_닫기가_모두_실패해도_처음_쓰기_�
     assert writer._buffer == [encode_record(record).encode("utf-8")]
 
 
-# 항목 26
 def test_flush_되돌리기까지_실패해도_들고_나간_줄이_append_순서대로_버퍼에_그대로_남는다(tmp_path, monkeypatch):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path, interval_s=HUGE_INTERVAL_S)
-    # 항목 21의 broken 경로를 만들되, 줄이 둘 이상이어야 순서를 볼 수 있어서 직접 더 넣어요.
+    # _make_broken_writer와 같은 broken 경로를 만들되, 줄이 둘 이상이어야 순서를 볼 수 있어서 직접 더 넣어요.
     real_open = builtins.open
 
     def fake_open(*args, **kwargs):
@@ -720,7 +694,6 @@ class _CloseFailsFile:
         raise self._close_error
 
 
-# 항목 27
 def test_flush_쓰기_flush_fsync가_성공하고_닫기만_실패하면_줄은_버퍼로_돌아가지_않고_파일에_한_번만_남는다(tmp_path, monkeypatch):
     # 이미 fsync된 묶음을 다시 붙이면, 재시도가 중간에 끊겼을 때 새 값 뒤에 옛 값이 남을 수 있어요.
     path = tmp_path / "appendonly.aof"
@@ -777,7 +750,6 @@ class _WriteInterruptedFile:
         self.close_called = True
 
 
-# 항목 28
 def test_flush_쓰기에서_KeyboardInterrupt가_나도_파일은_닫고_예외는_그대로_올라온다(tmp_path, monkeypatch):
     path = tmp_path / "appendonly.aof"
     writer = AofWriter(path)
