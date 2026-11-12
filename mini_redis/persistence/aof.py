@@ -66,7 +66,7 @@ def decode_line(line):
     if not isinstance(record, dict):
         raise ValueError("레코드는 JSON 객체여야 해요")
     op = record.get("op")
-    if op not in _REQUIRED_FIELDS:
+    if not isinstance(op, str) or op not in _REQUIRED_FIELDS:
         raise ValueError(f"알 수 없는 op예요: {op!r}")
     for field, is_valid in _REQUIRED_FIELDS[op].items():
         if field not in record or not is_valid(record[field]):

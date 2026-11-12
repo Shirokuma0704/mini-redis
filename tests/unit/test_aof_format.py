@@ -111,6 +111,9 @@ def test_decode_line_with_crlf_ending_works():
         '{"op":"set","k":"a","v":"1"}',
         '{"op":"set","k":"a","v":"1","exp":"5000"}',
         '{"op":"nsver","ns":"u","ver":true}',
+        # op 가 문자열이 아니면(해시 불가 값 포함) TypeError 가 아니라 ValueError 여야 한다
+        '{"op":[1]}',
+        '{"op":{"a":1}}',
     ],
     ids=[
         "truncated_in_the_middle",
@@ -121,6 +124,8 @@ def test_decode_line_with_crlf_ending_works():
         "set_without_exp",
         "exp_is_a_string",
         "ver_is_a_bool",
+        "op_is_a_list",
+        "op_is_an_object",
     ],
 )
 def test_decode_line_with_bad_line_raises_value_error(bad_line):
