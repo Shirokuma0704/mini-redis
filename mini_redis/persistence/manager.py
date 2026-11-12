@@ -152,7 +152,6 @@ class Persistence:
         self._monotonic = monotonic
         self.aof: AofWriter | None = None
         self.snapshotter: Snapshotter | None = None
-        self.recovered_versions: list[tuple[str, int]] = []
 
     def start(self, store: Store) -> RecoveredState:
         """복구한 키를 store에 싣고, 그 뒤에 AOF와 스냅샷 스레드를 켜요.
@@ -167,9 +166,8 @@ class Persistence:
         # store.set은 TTL도 타이밍 휠에 등록해요. 아직 AOF가 없으니 다시 기록되지 않아요.
         for entry in state.table.items():
             store.set(entry.key, entry.value, entry.expire_at_ms)
-        # #11이 Store에 버전 표를 줄 때까지는 복구한 버전을 그대로 들고 가요. 그래야 스냅샷이 버전을
-        # 지우지 않아요. #47이 머지되면 이 source가 Store의 버전 표로 바뀌어요.
-        self.recovered_versions = [(e.key, e.value) for e in state.versions.items()]
+        # 버전 표도 AOF를 붙이기 전에 복원해요. 복원은 변경이 아니라서 다시 기록되지 않아요.
+        store.restore_versions((e.key, e.value) for e in state.versions.items())
         aof = AofWriter(self._data_dir / aof_name(state.next_aof), interval_s=self._aof_interval_s)
         store.attach_aof(aof)
         snapshotter: Snapshotter | None = None
@@ -185,7 +183,7 @@ class Persistence:
                 max_aof_bytes=self._aof_max_bytes,
                 check_interval_s=self._check_interval_s,
                 monotonic=self._monotonic,
-                versions_source=lambda: list(self.recovered_versions),
+                versions_source=store.version_items,
             )
             snapshotter.start()
             self.snapshotter = snapshotter

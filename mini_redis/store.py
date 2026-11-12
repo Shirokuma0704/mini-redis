@@ -229,6 +229,22 @@ class Store:
         self._aof = aof
 
     @locked
+    def version_items(self) -> list[tuple[str, int]]:
+        """네임스페이스 버전 표를 (네임스페이스, 버전) 목록으로 복사한다. 스냅샷이 쓴다."""
+        return [(e.key, e.value) for e in self._versions._table.items()]
+
+    @locked
+    def restore_versions(self, pairs) -> None:
+        """복구한 (네임스페이스, 버전)을 표에 그대로 넣는다. 변경이 아니라 복원이라 on_change로 기록하지 않는다.
+
+        AOF가 붙은 뒤에는 쓸 수 없다. 복구는 AOF를 붙이기 전에 끝내야 한다.
+        """
+        if self._aof is not None:
+            raise RuntimeError("AOF가 붙은 뒤에는 버전을 복원할 수 없어요")
+        for ns, version in pairs:
+            self._versions._table.put(ns, version)
+
+    @locked
     def now_ms(self) -> int:
         return self._now_ms()
 
