@@ -25,6 +25,11 @@ def live(state):
     return sorted((e.key, e.value, e.expire_at_ms) for e in state.table.items())
 
 
+def version_map(state):
+    """버전 테이블(해시테이블)의 항목을 {네임스페이스: 버전} 딕셔너리로 바꿔요. 비교하기 쉽게 하려는 거예요."""
+    return {e.key: e.value for e in state.versions.items()}
+
+
 def write_aof(data_dir, number, *records, tail=b""):
     """레코드들을 AOF 파일 하나로 써요. tail은 줄바꿈 없는 잘린 꼬리를 흉내 낼 때 붙여요."""
     data = "".join(encode_record(r) for r in records).encode("utf-8") + tail
@@ -34,7 +39,8 @@ def write_aof(data_dir, number, *records, tail=b""):
 def test_recover_missing_dir_returns_empty_state(tmp_path):
     state = recover(tmp_path / "없는폴더", now_ms=1000)
     assert live(state) == []
-    assert state.versions == {}
+    assert version_map(state) == {}
+    assert isinstance(state.versions, HashTable)
     assert state.next_aof == 1
     assert state.dropped_tails == 0
 
@@ -42,7 +48,7 @@ def test_recover_missing_dir_returns_empty_state(tmp_path):
 def test_recover_empty_dir_returns_empty_state(tmp_path):
     state = recover(tmp_path, now_ms=1000)
     assert live(state) == []
-    assert state.versions == {}
+    assert version_map(state) == {}
     assert state.next_aof == 1
     assert state.dropped_tails == 0
 
@@ -184,14 +190,14 @@ def test_recover_flush_clears_earlier_keys_keeps_later_keys_and_versions(tmp_pat
     )
     state = recover(tmp_path, now_ms=1000)
     assert live(state) == [("b", "2", None)]
-    assert state.versions == {"user": 2}
+    assert version_map(state) == {"user": 2}
 
 
 def test_recover_nsver_last_record_wins_and_snapshot_only_namespace_stays(tmp_path):
     write_snapshot(tmp_path, [], [("user", 3), ("post", 8)], next_aof=1)
     write_aof(tmp_path, 1, ns_version_record("user", 4), ns_version_record("user", 5))
     state = recover(tmp_path, now_ms=1000)
-    assert state.versions == {"user": 5, "post": 8}
+    assert version_map(state) == {"user": 5, "post": 8}
 
 
 def test_recover_exp_equal_to_now_is_expired(tmp_path):

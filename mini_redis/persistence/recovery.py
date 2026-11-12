@@ -20,7 +20,7 @@ class RecoveredState:
     """복구 결과예요."""
 
     table: HashTable  # 만료되지 않은 살아 있는 키만 들어 있어요.
-    versions: dict[str, int]  # 네임스페이스 -> 버전
+    versions: HashTable  # 네임스페이스 -> 버전(int)이에요. 만료는 없어요.
     next_aof: int  # AOF 쓰기 쪽이 다음에 만들 파일 번호예요.
     dropped_tails: int  # 버린, 끝이 잘린 마지막 줄의 개수예요.
 
@@ -47,7 +47,7 @@ def _apply(state: RecoveredState, record: dict[str, Any]) -> None:
     elif op == "flush":
         state.table = HashTable()  # 버전은 그대로 두고 키만 비워요.
     elif op == "nsver":
-        state.versions[record["ns"]] = record["ver"]
+        state.versions.put(record["ns"], record["ver"], None)
 
 
 def _replay_file(state: RecoveredState, path: pathlib.Path) -> None:
@@ -85,7 +85,7 @@ def recover(data_dir: str | os.PathLike[str], now_ms: int) -> RecoveredState:
     스냅샷 임시 파일은 스냅샷을 쓰다 죽은 흔적일 수 있어서 읽지 않아요.
     """
     directory = pathlib.Path(data_dir)
-    state = RecoveredState(table=HashTable(), versions={}, next_aof=1, dropped_tails=0)
+    state = RecoveredState(table=HashTable(), versions=HashTable(), next_aof=1, dropped_tails=0)
 
     next_aof_start = 1
     snapshot_path = directory / SNAPSHOT_NAME
