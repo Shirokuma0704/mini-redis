@@ -21,7 +21,6 @@ def make_client(delay_ms=None):
     return TestClient(app), waited
 
 
-# 1
 def test_stats_item_3번_호출_후_calls_3():
     client, _ = make_client()
     for item_id in ("a", "b", "c"):
@@ -31,14 +30,12 @@ def test_stats_item_3번_호출_후_calls_3():
     assert response.json() == {"calls": 3}
 
 
-# 2
 def test_stats_연속_조회해도_카운트_안_변함():
     client, _ = make_client()
     assert client.get("/stats").json() == {"calls": 0}
     assert client.get("/stats").json() == {"calls": 0}
 
 
-# 3
 def test_items_같은_id_두번_같은_본문_카운트_2():
     client, _ = make_client()
     first = client.get("/items/7")
@@ -48,7 +45,6 @@ def test_items_같은_id_두번_같은_본문_카운트_2():
     assert client.get("/stats").json() == {"calls": 2}
 
 
-# 4
 def test_items_42_본문_모양_맞음():
     client, _ = make_client()
     response = client.get("/items/42")
@@ -56,7 +52,6 @@ def test_items_42_본문_모양_맞음():
     assert response.json() == {"id": "42", "value": "item-42"}
 
 
-# 5
 def test_items_기본_지연_200ms는_0점2초로_sleep_1번_호출():
     client, waited = make_client()
     client.get("/items/1")
@@ -65,14 +60,12 @@ def test_items_기본_지연_200ms는_0점2초로_sleep_1번_호출():
     assert waited == [0.2, 0.2]
 
 
-# 6
 def test_items_delay_50ms_주면_0점05초로_sleep():
     client, waited = make_client(delay_ms=50)
     client.get("/items/1")
     assert waited == [0.05]
 
 
-# 7
 def test_stats_와_reset은_sleep_호출_안_함():
     client, waited = make_client()
     client.get("/stats")
@@ -81,7 +74,6 @@ def test_stats_와_reset은_sleep_호출_안_함():
     assert waited == []
 
 
-# 8
 def test_reset_2번_호출_후_0으로_돌아가고_다시_센다():
     client, _ = make_client()
     client.get("/items/1")
@@ -94,7 +86,6 @@ def test_reset_2번_호출_후_0으로_돌아가고_다시_센다():
     assert client.get("/stats").json() == {"calls": 1}
 
 
-# 9
 def test_앱_두개_카운터_서로_분리():
     client_a, _ = make_client()
     client_b, _ = make_client()
@@ -104,7 +95,6 @@ def test_앱_두개_카운터_서로_분리():
     assert client_b.get("/stats").json() == {"calls": 0}
 
 
-# 10
 def test_모듈_기본값_app_존재하고_지연_200ms():
     assert origin.DEFAULT_DELAY_MS == 200
     assert hasattr(origin, "app")
