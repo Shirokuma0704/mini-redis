@@ -30,6 +30,7 @@ from .errors import (
 from .hashtable import HashTable
 from .lease import LeaseTable
 from .namespace import VersionTable
+from .persistence.aof import del_record, expire_record, flush_record, ns_version_record, set_record
 from .timing_wheel import TimingWheel, start_expiry_thread
 from .xfetch import should_refresh_early
 
@@ -112,10 +113,12 @@ class Store:
         max_keys: int = MAX_KEYS,
         random_fn=random.random,
         xfetch_beta: float = XFETCH_BETA,
+        aof=None,
     ):
         """clock: epoch ms를 돌려주는 함수. 테스트는 FakeClock을 넣는다.
 
         random_fn: [0, 1) 난수를 돌려주는 함수. XFetch의 조기 갱신 추첨에 쓰며, 테스트는 고정값을 넣는다.
+        aof: append(record) 를 가진 객체. None이면 기록하지 않는다.
         """
         self._clock = clock
         self._max_keys = max_keys
@@ -125,8 +128,9 @@ class Store:
         self._table = HashTable()
         self._wheel = TimingWheel(self._clock())
         self._leases = LeaseTable()
-        self._versions = VersionTable()  # FLUSH에도 유지한다
+        self._versions = VersionTable(on_change=lambda ns, v: self._log(ns_version_record(ns, v)))  # FLUSH에도 유지한다
         self._expiry_stop = None  # 만료 스레드를 멈추는 Event
+        self._aof = aof
 
     # --- 내부 도우미 (호출하는 공개 메서드가 락을 이미 잡고 있다) ---
 
@@ -144,6 +148,15 @@ class Store:
         validate_key(ns)
         version = self._versions.current(ns, self._now_ms())
         return f"{ns}:v{version}:{key}", version
+
+    def _log(self, record: dict) -> None:
+        """상태를 바꾸기 직전에 AOF에 기록한다 (기록 먼저, 변경은 그다음).
+
+        메모리에만 바뀌고 AOF에 없으면 재시작 때 사라지는데 클라이언트는 이미 성공을 봤기 때문이다.
+        append가 예외를 던지면 그대로 올라가고 그 변경은 일어나지 않는다.
+        """
+        if self._aof is not None:
+            self._aof.append(record)
 
     def _check_capacity(self, key: str) -> None:
         """새 키를 넣을 때만 상한을 검사한다 (덮어쓰기는 키 수가 늘지 않는다)."""
@@ -167,6 +180,12 @@ class Store:
         if entry is None or entry.expire_at_ms is None:
             return False
         if entry.expire_at_ms == expire_at_ms:
+            try:
+                self._log(del_record(key))
+            except BaseException:
+                # 휠은 이미 항목을 꺼냈어요. 로그가 실패하면 등록을 되돌려 다음 tick에 다시 시도하게 해요.
+                self._wheel.add(key, expire_at_ms)
+                raise
             self._table.delete(key)
             return True
         if entry.expire_at_ms > expire_at_ms:
@@ -197,11 +216,17 @@ class Store:
         if entry is None:
             return None
         if entry.expire_at_ms is not None and self._now_ms() >= entry.expire_at_ms:
+            self._log(del_record(key))
             self._table.delete(key)
             return None
         return entry
 
     # --- 공개 메서드 ---
+
+    @locked
+    def attach_aof(self, aof) -> None:
+        """AOF 기록기를 바꿔 끼운다 (None이면 기록 중단). 복구로 키를 먼저 채운 뒤 붙여서 복구분이 다시 기록되지 않게 한다."""
+        self._aof = aof
 
     @locked
     def now_ms(self) -> int:
@@ -266,6 +291,7 @@ class Store:
             # lease 발급부터 PUT까지가 값을 다시 만드는 데 걸린 시간이다 (XFetch의 delta)
             delta_ms = now - issued_at
         old_expire_at_ms = old.expire_at_ms if old is not None else None
+        self._log(set_record(key, value, expire_at_ms))
         self._table.put(key, value, expire_at_ms, delta_ms)
         self._schedule_expiry(key, old_expire_at_ms, expire_at_ms)
 
@@ -309,6 +335,7 @@ class Store:
         self._leases.drop(key)
         if self._get_live(key) is None:
             return False
+        self._log(del_record(key))
         return self._table.delete(key)
 
     @locked
@@ -340,6 +367,7 @@ class Store:
         result = current + amount
         if not INT64_MIN <= result <= INT64_MAX:
             raise NotInteger("결과가 64비트 정수 범위를 벗어납니다")
+        self._log(set_record(key, str(result), expire_at_ms))
         self._leases.drop(key)  # lease 없는 쓰기라 SET과 같이 진행 중인 lease를 무효화한다
         self._table.put(key, str(result), expire_at_ms)
         return result
@@ -359,10 +387,12 @@ class Store:
         if entry is None:
             return False
         if ttl <= 0:
-            self._table.delete(key)  # AOF(#12): DEL로 기록
+            self._log(del_record(key))
+            self._table.delete(key)
             return True
         old_expire_at_ms = entry.expire_at_ms
         new_expire_at_ms = self._now_ms() + ttl * 1000
+        self._log(expire_record(key, new_expire_at_ms))
         self._table.put(key, entry.value, new_expire_at_ms, entry.delta_ms)  # 값은 그대로라 delta도 유지
         self._schedule_expiry(key, old_expire_at_ms, new_expire_at_ms)
         return True
@@ -403,6 +433,7 @@ class Store:
         self._leases.drop_prefix(prefix)  # 키가 아직 없는 lease도 무효화한다 (DEL과 같은 이유)
         victims = self._live_keys_with_prefix(prefix)
         for key in victims:
+            self._log(del_record(key))
             self._table.delete(key)
         return len(victims)
 
@@ -424,6 +455,7 @@ class Store:
         """
         if confirm is not True:
             raise ConfirmRequired("FLUSH는 confirm=true가 필요합니다")
+        self._log(flush_record())
         self._table = HashTable()
         self._wheel = TimingWheel(self._now_ms())
         self._leases = LeaseTable()
@@ -436,6 +468,7 @@ class Store:
             if not entry.key.startswith(prefix):
                 continue
             if entry.expire_at_ms is not None and now >= entry.expire_at_ms:
+                self._log(del_record(entry.key))
                 self._table.delete(entry.key)
                 continue
             live.append(entry.key)
