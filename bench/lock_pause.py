@@ -12,7 +12,8 @@ bench/rehash_latency.py(#24)는 HashTable.put 하나의 시간만 쟀다. 그 RE
 - 리사이즈(점진적, main) / 리사이즈(일괄, 비교용): 마지막 리사이즈 문턱 바로 아래까지 채운 Store에 새 키를 넣어 리사이즈가 끝날 때까지 간다.
 
 기본은 GC를 끄고 잰다(#24와 같은 이유: GC 멈춤이 작업 효과를 가린다). --gc로 켤 수 있다.
-벽시계 값이라 행을 번갈아 --repeat번 돌려 통계마다 가장 작은 값을 쓴다. 반복별 최대 대기 목록도 결과에 남긴다.
+벽시계 값이라 행을 번갈아 --repeat번 돌리고, 결과에는 반복마다 한 줄씩 그대로 적는다(합쳐서 만든 최솟값은 쓰지 않는다).
+작업마다 최대 대기의 최솟값 / 중앙값 / 최댓값을 따로 요약한다.
 Store 단계의 측정이다. HTTP는 자기 오버헤드를 더하고, GIL 넘겨받기 비용은 대조 B가 보여 준다.
 
 레포 루트에서:  python -m bench.lock_pause [--keys 1000000] [--repeat 3] [--prefix-share 0.1] [--gc] [--out PATH]
@@ -21,6 +22,7 @@ import argparse
 import gc
 import os
 import platform
+import statistics
 import sys
 import threading
 import time
@@ -41,6 +43,7 @@ DEFAULT_WINDOW_S = 0.2  # 대조 A를 단독으로 부를 때의 구간 길이
 MAX_CONTROL_WINDOW_S = 10.0
 CAPACITY = 6_000_000  # 희생자가 기록할 수 있는 호출 수. 미리 잡아 두어 기록 중 할당이 끼지 않게 한다
 OVER_NS = 1_000_000  # 1ms
+SMALL_N = 100_000  # 이보다 작은 키 수에서는 리사이즈 행 구간이 너무 짧다
 
 ROW_LABELS = {
     "control_a": "대조 A: 희생자 혼자",
@@ -52,6 +55,8 @@ ROW_LABELS = {
     "resize_bulk": "리사이즈 (일괄, 비교용)",
 }
 RESIZE_ROWS = ("resize_incremental", "resize_bulk")
+RESIZE_NAME = "GET이 같이 옮겨 주는 리해싱, 두 스레드"
+NO_OVERLAP = "겹친 요청 없음"
 
 
 def build_store(row_id, n_keys, prefix_share):
@@ -106,10 +111,11 @@ class Victim(threading.Thread):
 
 
 def victim_stats(victim, t0, t1):
-    """작업 구간 [t0, t1]과 겹치는 호출의 지연 통계: t0 뒤에 끝난 첫 호출부터 t1까지 시작한 호출.
+    """작업 구간 [t0, t1]과 겹치는 호출의 지연 통계. 겹침 = 호출 끝 >= t0 그리고 호출 시작 <= t1.
 
-    구간이 아주 짧아 메인이 GIL을 쥔 채 끝나면 겹치는 호출이 없을 수 있다. 그때는 t0 뒤에 끝난 첫 호출 하나를 쓴다
-    (작업 직후 들어온 요청이 본 값).
+    겹치는 호출이 없으면 victim_calls = 0, 나머지는 None이다(대체값을 만들지 않는다).
+    구간이 아주 짧아 메인이 GIL을 쥔 채 끝나면 실제로 그럴 수 있다.
+    p99는 최근접 순위(ceil(0.99 * n)번째로 작은 값, 최소 1번째)로 bench/cache_effect.py와 같은 정의다.
     """
     n = victim.count
     starts, lats = victim.starts, victim.lats
@@ -118,17 +124,18 @@ def victim_stats(victim, t0, t1):
         first += 1
     window = []
     for i in range(first, n):
-        if starts[i] > t1 and window:
-            break
-        window.append(lats[i])
         if starts[i] > t1:
             break
+        window.append(lats[i])
     window.sort()
     k = len(window)
+    if k == 0:
+        return {"victim_calls": 0, "max_ns": None, "p99_ns": None, "over_1ms": None}
+    rank = max(1, (99 * k + 99) // 100)  # ceil(0.99 * k)
     return {
         "victim_calls": k,
-        "max_ns": window[-1] if k else 0,
-        "p99_ns": window[min(k - 1, k * 99 // 100)] if k else 0,
+        "max_ns": window[-1],
+        "p99_ns": window[rank - 1],
         "over_1ms": sum(x > OVER_NS for x in window),
     }
 
@@ -158,6 +165,10 @@ def _op(row_id, store, n_keys):
             while True:
                 store.set(f"new:{i}", "v")
                 i += 1
+                if i == 1 and n_keys < SMALL_N:
+                    # 스모크처럼 작은 크기에서는 구간이 GIL 전환 간격(5ms)보다 짧아 희생자가 한 번도 못 돌 수 있다.
+                    # 그래서 첫 SET 뒤 1ms 쉬어 희생자가 구간 안에서 돌게 한다. 실제 크기(SMALL_N 이상)에는 넣지 않는다.
+                    time.sleep(0.001)
                 if store._table._old is None:  # 리해싱이 끝났다
                     return {"puts": i}
                 if i > limit:
@@ -178,6 +189,7 @@ def run_row(row_id, n_keys, prefix_share, use_gc=False, window_s=None):
             store._live_keys_with_prefix(PREFIX)
         scan_ns = time.perf_counter_ns() - t
     work = None if row_id == "control_a" else _op(row_id, store, n_keys)
+    initial_size = store.size()
 
     gc.collect()
     was_enabled = gc.isenabled()
@@ -203,6 +215,10 @@ def run_row(row_id, n_keys, prefix_share, use_gc=False, window_s=None):
     if victim.overflow:
         raise RuntimeError(f"희생자 기록 칸({CAPACITY:,})이 찼어요")
     result = {"duration_ns": t1 - t0, "scan_ns": scan_ns, **extra, **victim_stats(victim, t0, t1)}
+    if row_id in RESIZE_ROWS:
+        # 이 행들은 N이 아니라 마지막 리사이즈 문턱 바로 아래에서 시작하므로 크기를 따로 남긴다.
+        result["initial_size"] = initial_size
+        result["final_size"] = store.size()
     return result
 
 
@@ -221,12 +237,16 @@ def measure(n_keys, repeat, prefix_share, use_gc):
     return runs
 
 
-def best_of(rs):
-    out = {k: min(r[k] for r in rs) for k in ("duration_ns", "max_ns", "p99_ns", "over_1ms", "victim_calls")}
-    scans = [r["scan_ns"] for r in rs if r["scan_ns"] is not None]
-    out["scan_ns"] = min(scans) if scans else None
-    out["max_list"] = [r["max_ns"] for r in rs]
-    return out
+def _ms(ns):
+    return NO_OVERLAP if ns is None else f"{ns / 1e6:.2f}"
+
+
+def _summary(rs):
+    """반복들의 최대 대기 (최솟값, 중앙값, 최댓값). 겹친 요청이 없던 반복은 뺀다. 하나도 없으면 None."""
+    vals = [r["max_ns"] for r in rs if r["max_ns"] is not None]
+    if not vals:
+        return None
+    return min(vals), statistics.median(vals), max(vals)
 
 
 def to_markdown(n_keys, repeat, prefix_share, use_gc, runs):
@@ -236,30 +256,58 @@ def to_markdown(n_keys, repeat, prefix_share, use_gc, runs):
         "# 락 멈춤 측정 결과",
         "",
         f"한 Store에 키 {n_keys:,}개를 넣고, 다른 스레드가 `{HOT_KEY}`를 계속 get하는 동안 메인 스레드가 O(N) 작업을 한다.",
-        "\"다른 요청 최대 대기\"는 작업 구간에서 시작한(또는 시작 때 진행 중이던) 그 get들의 지연이다.",
+        "\"최대 대기\"는 작업 구간과 겹친 그 get들(끝 >= 작업 시작, 시작 <= 작업 끝)의 지연이다.",
+        f"겹친 요청이 하나도 없으면 호출 수는 0이고 지연 칸은 \"{NO_OVERLAP}\"이다.",
         "Store 단계의 측정이다. HTTP는 자기 오버헤드를 더하고, GIL 넘겨받기 비용은 대조 B가 보여 준다.",
         "`python -m bench.lock_pause`가 이 파일을 다시 만든다.",
         "",
         f"- 기계: {platform.platform()}, {platform.processor()}, CPU {os.cpu_count()}개, Python {platform.python_version()}",
         f"- 키 수 N: {n_keys:,} (prefix 행은 `{PREFIX}` 키 {n_prefix:,}개 = 비율 {prefix_share}, 나머지는 `key:`)",
-        f"- 반복: 행을 번갈아 {repeat}번, 통계마다 가장 작은 값",
+        f"- 반복: 행을 번갈아 {repeat}번, 반복마다 한 줄씩 그대로 적는다",
         f"- GC: {'켬' if use_gc else '끔'}",
         f"- sys.getswitchinterval(): {sys.getswitchinterval()}초",
         "",
-        "| 작업 | 작업 시간(ms) | (prefix만) 스캔(ms) | 다른 요청 최대 대기(ms) | p99(µs) | 1ms 넘은 요청 |",
+        "## 반복별 결과",
+        "",
+        "| 작업 | 반복 | 작업 시간(ms) | (prefix만) 스캔(ms) | 최대 대기(ms) | p99(µs) | 1ms 넘은 요청 | 희생자 호출 수 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row_id, label in ROW_LABELS.items():
+        for i, r in enumerate(runs[row_id], 1):
+            scan = "-" if r["scan_ns"] is None else f"{r['scan_ns'] / ms:.2f}"
+            p99 = NO_OVERLAP if r["p99_ns"] is None else f"{r['p99_ns'] / us:.1f}"
+            over = NO_OVERLAP if r["over_1ms"] is None else f"{r['over_1ms']:,}"
+            lines.append(
+                f"| {label} | {i} | {r['duration_ns'] / ms:.2f} | {scan} | {_ms(r['max_ns'])} "
+                f"| {p99} | {over} | {r['victim_calls']:,} |"
+            )
+    lines += [
+        "",
+        "## 작업별 최대 대기 요약(ms)",
+        "",
+        "| 작업 | 최대 대기 최솟값 | 최대 대기 중앙값 | 최대 대기 최댓값 |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for row_id, label in ROW_LABELS.items():
+        summ = _summary(runs[row_id])
+        cells = [NO_OVERLAP] * 3 if summ is None else [f"{x / ms:.2f}" for x in summ]
+        lines.append(f"| {label} | {cells[0]} | {cells[1]} | {cells[2]} |")
+    lines += [
+        "",
+        f"## {RESIZE_NAME}",
+        "",
+        f"리사이즈 두 행은 {RESIZE_NAME}이다. 희생자의 GET도 버킷을 옮기므로 점진적 행의 리해싱은 두 스레드가 나눠 한다.",
+        "이 행들의 처음 크기는 N과 다르다. 마지막 리사이즈 문턱 바로 아래까지만 채운 Store에서 시작해, 새 키를 넣어 리사이즈가 끝날 때까지 가기 때문이다.",
+        "",
+        "| 작업 | 반복 | 처음 크기 | 최종 크기 | 메인 스레드 SET 수 | 희생자 GET 수 |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
     ]
-    best = {r: best_of(rs) for r, rs in runs.items()}
-    for row_id, label in ROW_LABELS.items():
-        b = best[row_id]
-        scan = "-" if b["scan_ns"] is None else f"{b['scan_ns'] / ms:.2f}"
-        lines.append(
-            f"| {label} | {b['duration_ns'] / ms:.2f} | {scan} | {b['max_ns'] / ms:.2f} "
-            f"| {b['p99_ns'] / us:.1f} | {b['over_1ms']:,} |"
-        )
-    lines += ["", "## 반복별 최대 대기(ms)", "", "| 작업 | 반복별 |", "| --- | --- |"]
-    for row_id, label in ROW_LABELS.items():
-        lines.append(f"| {label} | {', '.join(f'{x / ms:.2f}' for x in best[row_id]['max_list'])} |")
+    for row_id in RESIZE_ROWS:
+        for i, r in enumerate(runs[row_id], 1):
+            lines.append(
+                f"| {ROW_LABELS[row_id]} | {i} | {r['initial_size']:,} | {r['final_size']:,} "
+                f"| {r['puts']:,} | {r['victim_calls']:,} |"
+            )
     lines += [
         "",
         "대조 A의 \"작업 시간\"은 구간 길이(그 반복에서 가장 긴 작업, 최대 10초)다.",
