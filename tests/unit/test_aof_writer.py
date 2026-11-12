@@ -4,8 +4,11 @@ time.sleep은 쓰지 않아요. flush()를 직접 부르고, 스레드 테스트
 루프가 혼자 돌지 않게 한 뒤 stop()에 기대요.
 """
 
+import builtins
+import os
 import threading
 
+import mini_redis.persistence.aof as aof_module
 from mini_redis.persistence.aof import (
     AofWriter,
     decode_line,
@@ -183,4 +186,198 @@ def test_여러_스레드가_append하며_flush해도_1000줄이_스레드별_�
         thread_part, index_part = record["k"].split("-")
         seen[int(thread_part[1:])].append(int(index_part))
     for t in range(thread_count):
+        assert seen[t] == list(range(per_thread))
+
+
+# 항목 13
+def test_flush_open이_한_번_실패하면_줄이_버퍼에_남아_다음_flush에_순서대로_적힌다(tmp_path, monkeypatch):
+    path = tmp_path / "appendonly.aof"
+    writer = AofWriter(path)
+    real_open = builtins.open
+    error = PermissionError("잠시 막혔어요")
+    calls = []
+
+    def flaky_open(*args, **kwargs):
+        if not calls:
+            calls.append(1)
+            raise error
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(aof_module, "open", flaky_open, raising=False)
+    a = set_record("a", "1", None)
+    b = set_record("b", "2", None)
+    writer.append(a)
+    try:
+        writer.flush()
+        raised = None
+    except OSError as e:
+        raised = e
+    assert raised is error
+    assert writer.last_error is error
+    writer.append(b)
+    assert writer.flush() == 2
+    assert [decode_line(line) for line in read_lines(path)] == [a, b]
+    assert writer.last_error is None
+
+
+# 항목 14
+def test_flush_fsync가_쓰기_뒤에_실패해도_다음_flush에_각_줄이_정확히_한_번씩만_남는다(tmp_path, monkeypatch):
+    path = tmp_path / "appendonly.aof"
+    writer = AofWriter(path)
+    real_fsync = os.fsync
+    calls = []
+
+    def flaky_fsync(fd):
+        if not calls:
+            calls.append(1)
+            raise OSError("fsync 실패")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(aof_module.os, "fsync", flaky_fsync)
+    a = set_record("a", "1", None)
+    b = set_record("b", "2", None)
+    writer.append(a)
+    writer.append(b)
+    try:
+        writer.flush()
+        raised = None
+    except OSError as e:
+        raised = e
+    assert raised is not None
+    assert writer.last_error is raised
+    assert writer.flush() == 2
+    assert path.read_bytes() == expected_bytes([a, b])
+    assert writer.last_error is None
+
+
+# 항목 15
+def test_stop_flush가_실패한_뒤에_불러도_실패했던_줄이_파일에_남는다(tmp_path, monkeypatch):
+    path = tmp_path / "appendonly.aof"
+    writer = AofWriter(path, interval_s=HUGE_INTERVAL_S)
+    real_open = builtins.open
+    calls = []
+
+    def flaky_open(*args, **kwargs):
+        if not calls:
+            calls.append(1)
+            raise PermissionError("잠시 막혔어요")
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(aof_module, "open", flaky_open, raising=False)
+    record = set_record("a", "1", None)
+    writer.append(record)
+    try:
+        writer.flush()
+    except OSError:
+        pass
+    writer.stop()
+    assert path.read_bytes() == expected_bytes([record])
+
+
+# 항목 16
+def test_flush_fsync가_정말_불리고_빈_flush는_더_부르지_않는다(tmp_path, monkeypatch):
+    path = tmp_path / "appendonly.aof"
+    writer = AofWriter(path)
+    real_fsync = os.fsync
+    calls = []
+
+    def counting_fsync(fd):
+        calls.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(aof_module.os, "fsync", counting_fsync)
+    writer.append(CP1_RECORDS[0])
+    assert writer.flush() == 1
+    assert len(calls) == 1
+    assert writer.flush() == 0
+    assert len(calls) == 1
+
+
+# 항목 17
+def test_stop_없이도_interval마다_flush가_돌아_줄이_파일에_적힌다(tmp_path, monkeypatch):
+    path = tmp_path / "appendonly.aof"
+    writer = AofWriter(path, interval_s=0.01)
+    real_fsync = os.fsync
+    done = threading.Event()
+
+    def signaling_fsync(fd):
+        real_fsync(fd)
+        done.set()
+
+    monkeypatch.setattr(aof_module.os, "fsync", signaling_fsync)
+    writer.append(CP1_RECORDS[0])
+    writer.start()
+    try:
+        assert done.wait(5) is True
+        assert path.read_bytes() == expected_bytes([CP1_RECORDS[0]])
+        assert writer._thread.is_alive()
+    finally:
+        writer.stop()
+
+
+# 항목 18
+def test_백그라운드_스레드는_flush가_실패해도_살아남아_다음_주기에_줄을_적는다(tmp_path, monkeypatch):
+    path = tmp_path / "appendonly.aof"
+    writer = AofWriter(path, interval_s=0.01)
+    real_fsync = os.fsync
+    calls = []
+    done = threading.Event()
+
+    def flaky_fsync(fd):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("fsync 실패")
+        real_fsync(fd)
+        done.set()
+
+    monkeypatch.setattr(aof_module.os, "fsync", flaky_fsync)
+    writer.append(CP1_RECORDS[0])
+    writer.start()
+    try:
+        assert done.wait(5) is True
+        assert writer._thread.is_alive()
+        assert path.read_bytes() == expected_bytes([CP1_RECORDS[0]])
+    finally:
+        writer.stop()
+
+
+# 항목 19
+def test_flush_스레드_둘이_동시에_돌아도_1000줄이_스레드별_순서대로_남는다(tmp_path):
+    path = tmp_path / "appendonly.aof"
+    writer = AofWriter(path)
+    appender_count = 4
+    flusher_count = 2
+    per_thread = 250
+    barrier = threading.Barrier(appender_count + flusher_count)
+    appenders_done = threading.Event()
+
+    def appender(thread_id):
+        barrier.wait()
+        for i in range(per_thread):
+            writer.append(set_record(f"t{thread_id}-{i}", str(i), None))
+
+    def flusher():
+        barrier.wait()
+        while not appenders_done.is_set():
+            writer.flush()
+
+    appenders = [threading.Thread(target=appender, args=(t,)) for t in range(appender_count)]
+    flushers = [threading.Thread(target=flusher) for _ in range(flusher_count)]
+    for t in appenders + flushers:
+        t.start()
+    for t in appenders:
+        t.join()
+    appenders_done.set()
+    for t in flushers:
+        t.join()
+    writer.flush()
+
+    lines = read_lines(path)
+    assert len(lines) == appender_count * per_thread
+    records = [decode_line(line) for line in lines]
+    seen = {t: [] for t in range(appender_count)}
+    for record in records:
+        thread_part, index_part = record["k"].split("-")
+        seen[int(thread_part[1:])].append(int(index_part))
+    for t in range(appender_count):
         assert seen[t] == list(range(per_thread))

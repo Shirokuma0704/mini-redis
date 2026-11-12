@@ -93,6 +93,7 @@ class AofWriter:
         self._write_lock = threading.Lock()  # flush끼리 순서가 섞이지 않게 해요.
         self._stop_event = threading.Event()
         self._thread = None
+        self.last_error = None  # 마지막 flush가 실패했다면 그 예외예요.
 
     def append(self, record):
         """레코드를 한 줄로 바꿔 버퍼에 더해요. 파일은 건드리지 않아요."""
@@ -109,10 +110,27 @@ class AofWriter:
             if not lines:
                 return 0
             data = "".join(lines).encode("utf-8")
-            with open(self.path, "ab") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
+            try:
+                with open(self.path, "ab") as f:
+                    start_size = f.tell()  # 이번 시도 전 파일 크기예요.
+                    try:
+                        f.write(data)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    except Exception:
+                        # 반쯤 쓴 바이트가 남지 않게 원래 크기로 잘라 내요.
+                        try:
+                            f.truncate(start_size)
+                        except Exception:
+                            pass  # 처음 에러가 더 중요해서 이 에러는 무시해요.
+                        raise
+            except Exception as error:
+                # 들고 나간 줄을 버퍼 맨 앞에 되돌려서 다음 flush가 먼저 적게 해요.
+                with self._buffer_lock:
+                    self._buffer = lines + self._buffer
+                self.last_error = error
+                raise
+            self.last_error = None
             return len(lines)
 
     def start(self):
@@ -133,4 +151,7 @@ class AofWriter:
 
     def _run(self):
         while not self._stop_event.wait(self._interval_s):
-            self.flush()
+            try:
+                self.flush()
+            except Exception:
+                pass  # last_error에 남아 있고, 다음 주기에 다시 써요.
