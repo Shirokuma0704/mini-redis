@@ -13,6 +13,8 @@ from .clock import system_clock_ms
 from .config import MAX_KEY_BYTES, MAX_KEYS, MAX_VALUE_BYTES
 from .errors import (
     CapacityExceeded,
+    ConfirmRequired,
+    EmptyPrefix,
     InvalidKey,
     InvalidValue,
     KeyNotFound,
@@ -68,6 +70,11 @@ def parse_int64(text: str) -> int:
     if not INT64_MIN <= n <= INT64_MAX:
         raise NotInteger("값이 64비트 정수 범위를 벗어납니다")
     return n
+
+
+def _validate_prefix(prefix) -> None:
+    if not isinstance(prefix, str):
+        raise InvalidValue("prefix는 문자열이어야 합니다")
 
 
 @dataclass(frozen=True)
@@ -182,3 +189,50 @@ class Store:
             raise NotInteger("결과가 64비트 정수 범위를 벗어납니다")
         self._table.put(key, str(result), expire_at_ms)
         return result
+
+    @locked
+    def keys(self, prefix: str = "") -> list[str]:
+        """prefix로 시작하는 살아 있는 키 목록 (정렬). 빈 prefix는 전체.
+
+        O(capacity + n)이고 락을 끝까지 잡는다. 순회 중 만나는 만료 키는 지운다.
+        """
+        _validate_prefix(prefix)
+        return sorted(self._live_keys_with_prefix(prefix))
+
+    @locked
+    def delete_prefix(self, prefix: str) -> int:
+        """prefix로 시작하는 키를 모두 지우고 살아 있던 키의 개수를 돌려준다.
+
+        원자성을 위해 락을 끝까지 잡는다 (O(N), 키 상한 안에서 멈춤은 감수).
+        빈 prefix는 EmptyPrefix(400) — 전체 삭제는 flush를 쓴다.
+        """
+        _validate_prefix(prefix)
+        if prefix == "":
+            raise EmptyPrefix("빈 prefix로는 지울 수 없습니다 (전체 삭제는 FLUSH)")
+        victims = self._live_keys_with_prefix(prefix)
+        for key in victims:
+            self._table.delete(key)
+        return len(victims)
+
+    @locked
+    def flush(self, confirm: bool = False) -> None:
+        """모든 키를 지운다. 새 해시테이블로 참조를 바꿔 끼우므로 O(1)이다.
+
+        옛 테이블은 가비지 컬렉터가 치운다. 실수로 호출하지 못하게 confirm=True가 필요하다.
+        """
+        if confirm is not True:
+            raise ConfirmRequired("FLUSH는 confirm=true가 필요합니다")
+        self._table = HashTable()
+
+    def _live_keys_with_prefix(self, prefix: str) -> list[str]:
+        """호출하는 메서드가 락을 잡고 있다. 만료된 키는 지우고 목록에서 뺀다."""
+        now = self._now_ms()
+        live = []
+        for entry in self._table.items():
+            if not entry.key.startswith(prefix):
+                continue
+            if entry.expire_at_ms is not None and now >= entry.expire_at_ms:
+                self._table.delete(entry.key)
+                continue
+            live.append(entry.key)
+        return live

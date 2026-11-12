@@ -38,3 +38,13 @@ class KeyNotFound(MiniRedisError):
 class NotInteger(MiniRedisError):
     status = 409
     code = "NOT_INTEGER"
+
+
+class EmptyPrefix(MiniRedisError):
+    status = 400
+    code = "EMPTY_PREFIX"
+
+
+class ConfirmRequired(MiniRedisError):
+    status = 400
+    code = "CONFIRM_REQUIRED"
