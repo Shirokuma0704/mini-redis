@@ -21,6 +21,7 @@ LEASE_RETRY_MS = 100  # lease 대기자에게 주는 retry_after_ms. 보유자�
 XFETCH_BETA = 1.0  # 클수록 만료 전에 더 일찍 갱신을 시작한다 (논문 기본값 1)
 
 AOF_FSYNC_INTERVAL_S = 1
+AOF_REJECT_AFTER_S = 2  # flush가 이만큼 계속 실패하면 쓰기를 거절한다
 SNAPSHOT_INTERVAL_S = 300
 SNAPSHOT_AOF_MAX_BYTES = 10 * 1024 * 1024
 DATA_DIR = "data"

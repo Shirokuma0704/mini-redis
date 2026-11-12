@@ -180,7 +180,12 @@ class Store:
         if entry is None or entry.expire_at_ms is None:
             return False
         if entry.expire_at_ms == expire_at_ms:
-            self._log(del_record(key))
+            try:
+                self._log(del_record(key))
+            except BaseException:
+                # 휠은 이미 항목을 꺼냈어요. 로그가 실패하면 등록을 되돌려 다음 tick에 다시 시도하게 해요.
+                self._wheel.add(key, expire_at_ms)
+                raise
             self._table.delete(key)
             return True
         if entry.expire_at_ms > expire_at_ms:

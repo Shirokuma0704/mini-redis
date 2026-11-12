@@ -253,3 +253,68 @@ def test_store_aof_default_without_aof_round_trips(clock):
     s.set("a", "1")
     assert s.get("a").value == "1"
     assert s.delete("a") is True
+
+
+# --- CP4 K1: DEL 기록이 실패하면 휠 등록을 되돌린다 ---
+
+
+class DelFailsAof:
+    """del 레코드만 실패하고, 나머지는 기록해 두는 가짜 AOF예요."""
+
+    def __init__(self):
+        self.records = []
+
+    def append(self, record):
+        if record["op"] == "del":
+            raise OSError("DEL 기록 실패")
+        self.records.append(record)
+
+
+def test_store_aof_wheel_del_log_failure_keeps_key_and_retries_after_aof_swap(clock):
+    s = Store(clock=clock, aof=RecordingAof())
+    s.set("k", "v", expire_at_ms=T0 + 1000)
+    clock.advance(2000)
+    s.attach_aof(DelFailsAof())
+    with pytest.raises(OSError):
+        s.expire_tick()
+    assert s.size() == 1  # 기록이 실패했으니 테이블 엔트리는 그대로예요
+
+    working = RecordingAof()
+    s.attach_aof(working)
+    assert s.expire_tick() == 1  # 휠 등록이 살아 있어서 다음 tick에 다시 꺼내져요
+    assert working.records == [del_record("k")]
+    assert s.size() == 0
+
+
+# --- CP4 K1 곁가지: lease 경로에서 기록이 남는 모양 ---
+
+
+def test_store_aof_get_lease_on_miss_logs_nothing(store, fake):
+    with pytest.raises(KeyNotFound):
+        store.get("k", lease=True)
+    assert fake.records == []
+
+
+def test_store_aof_set_with_issued_lease_token_logs_exactly_one_set(store, fake):
+    with pytest.raises(KeyNotFound) as e:
+        store.get("k", lease=True)
+    token = e.value.extra["lease"]
+    store.set("k", "v", T0 + 60_000, lease=token)
+    assert fake.records == [set_record("k", "v", T0 + 60_000)]
+
+
+def test_store_aof_set_with_wrong_lease_token_raises_lease_invalid_and_logs_nothing(store, fake):
+    from mini_redis.errors import LeaseInvalid
+
+    with pytest.raises(KeyNotFound):
+        store.get("k", lease=True)
+    with pytest.raises(LeaseInvalid):
+        store.set("k", "v", T0 + 60_000, lease="0000000000000000")
+    assert fake.records == []
+
+
+def test_store_aof_delete_missing_key_after_lease_miss_logs_nothing(store, fake):
+    with pytest.raises(KeyNotFound):
+        store.get("k", lease=True)
+    assert store.delete("nope") is False
+    assert fake.records == []

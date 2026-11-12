@@ -79,3 +79,10 @@ class GuardRequired(MiniRedisError):
 class VersionMismatch(MiniRedisError):
     status = 409
     code = "VERSION_MISMATCH"
+
+
+class PersistenceUnavailable(MiniRedisError):
+    """AOF에 적을 수 없어서 쓰기를 받지 못한다 (디스크 실패가 이어지거나 파일이 깨졌을 때)."""
+
+    status = 503
+    code = "PERSISTENCE_UNAVAILABLE"

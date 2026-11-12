@@ -7,9 +7,12 @@
 import json
 import os
 import threading
+import time
+from collections.abc import Callable
 from typing import Any
 
 from mini_redis import config
+from mini_redis.errors import PersistenceUnavailable
 
 
 def set_record(key: str, value: str, expire_at_ms: int | None = None) -> dict[str, Any]:
@@ -79,8 +82,12 @@ def decode_line(line: str) -> dict[str, Any]:
     return record
 
 
-class AofBrokenError(RuntimeError):
+class AofBrokenError(PersistenceUnavailable, RuntimeError):
     """롤백까지 실패해서 AOF 파일 끝이 깨졌을 수 있을 때 던져요. 더 적지 않고 멈춰요."""
+
+
+class AofUnavailableError(PersistenceUnavailable):
+    """디스크 쓰기가 reject_after_s초 넘게 계속 실패해서 새 쓰기를 받지 않을 때 던져요."""
 
 
 class AofWriter:
@@ -94,12 +101,18 @@ class AofWriter:
         self,
         path: str | os.PathLike[str],
         interval_s: float = config.AOF_FSYNC_INTERVAL_S,
+        reject_after_s: float = config.AOF_REJECT_AFTER_S,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.path = path
         self._interval_s = interval_s
+        self._reject_after_s = reject_after_s
+        self._monotonic = monotonic
+        # flush가 연속으로 실패하기 시작한 시각(단조 시계)이에요. 오류 없이 flush가 끝나면 None으로 돌아가요.
+        self.failing_since: float | None = None
         self._buffer: list[bytes] = []
         self._buffer_lock = threading.Lock()  # 버퍼를 바꿔 끼울 때만 잡아요.
-        self._write_lock = threading.Lock()  # flush끼리 순서가 섞이지 않게 해요.
+        self._write_lock = threading.RLock()  # flush끼리 순서가 섞이지 않게 해요.
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self.last_error: BaseException | None = None  # 마지막 flush가 실패했다면 그 예외예요.
@@ -112,15 +125,40 @@ class AofWriter:
 
         인코딩을 여기서 미리 해요. flush에서 실패하면 들고 나간 줄들이 통째로 사라질 수 있어서,
         못 쓰는 레코드는 append 단계에서 바로 예외로 돌려줘요.
+
+        flush가 reject_after_s초 넘게 계속 실패 중이면 AofUnavailableError로 거절해요.
+        알려진 한계: 저장소는 로그를 먼저 적고 나서 바꾸기 때문에 거절된 쓰기는 반영되지 않지만,
+        lease를 걸고 하는 PUT이 로그에서 거절되면 그 lease는 이미 쓰인 뒤예요. 클라이언트는
+        GET ?lease=1로 lease를 다시 받아야 해요.
         """
         if self.broken:
             raise AofBrokenError("AOF 파일이 깨진 상태라 더 적을 수 없어요")
+        since = self.failing_since
+        if since is not None and self._monotonic() - since >= self._reject_after_s:
+            raise AofUnavailableError(
+                f"AOF를 {self._reject_after_s:g}초 넘게 디스크에 쓰지 못해서 쓰기를 받지 않아요"
+            )
         line = encode_record(record).encode("utf-8")
         with self._buffer_lock:
             self._buffer.append(line)
 
     def flush(self) -> int:
-        """버퍼를 파일에 적고 fsync해요. 적은 줄 수를 돌려줘요."""
+        """버퍼를 파일에 적고 fsync해요. 적은 줄 수를 돌려줘요.
+
+        실패하면 failing_since에 첫 실패 시각을 남기고, 오류 없이 끝나면 지워요.
+        """
+        with self._write_lock:
+            try:
+                written = self._flush_locked()
+            except BaseException:
+                if self.failing_since is None:
+                    self.failing_since = self._monotonic()
+                raise
+            self.failing_since = None
+            return written
+
+    def _flush_locked(self) -> int:
+        """실제로 버퍼를 파일에 적어요. flush()가 쓰기 락을 잡고 불러요."""
         with self._write_lock:
             if self.broken:
                 # 파일을 열지도, 버퍼를 건드리지도 않고 바로 멈춰요.
