@@ -207,3 +207,172 @@ def test_sample_app_원본이_NaN_본문을_주면_502_ORIGIN_ERROR_캐시에_�
     assert response.json()["error"] == "ORIGIN_ERROR"
     assert cache.get("/keys/item%3A1").status_code == 404
     assert app.get("/stats").json() == {"hits": 0, "misses": 0}
+
+
+# --- 캐시 끄기 모드 (use_cache=False, #18) ---
+
+
+def failing_cache():
+    """호출되면 바로 실패하는 캐시 클라이언트. 끄기 모드가 캐시를 건드리지 않는지 확인하는 데 써요."""
+
+    def fail(request):
+        raise AssertionError(f"캐시를 건드렸어요: {request.method} {request.url}")
+
+    return mock_client(fail)
+
+
+def test_sample_app_캐시_끄기_같은_id_두번_모두_200_BYPASS_원본_2번_stats는_misses_2(origin):
+    app = TestClient(create_sample_app(failing_cache(), origin, ttl_s=60, use_cache=False))
+    first = app.get("/items/1")
+    second = app.get("/items/1")
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.headers["X-Cache"] == "BYPASS"
+    assert second.headers["X-Cache"] == "BYPASS"
+    assert first.json() == {"id": "1", "value": "item-1"}
+    assert origin_calls(origin) == 2
+    assert app.get("/stats").json() == {"hits": 0, "misses": 2}
+
+
+def test_sample_app_캐시_끄기_cache가_None이어도_똑같이_동작해요(origin):
+    app = TestClient(create_sample_app(None, origin, ttl_s=60, use_cache=False))
+    first = app.get("/items/1")
+    second = app.get("/items/1")
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.headers["X-Cache"] == "BYPASS"
+    assert second.headers["X-Cache"] == "BYPASS"
+    assert origin_calls(origin) == 2
+    assert app.get("/stats").json() == {"hits": 0, "misses": 2}
+
+
+def test_sample_app_캐시_끄기_원본이_500이면_502_ORIGIN_ERROR이고_misses는_0():
+    origin = mock_client(lambda request: httpx.Response(500, json={"error": "BOOM"}))
+    app = TestClient(create_sample_app(failing_cache(), origin, ttl_s=60, use_cache=False))
+    response = app.get("/items/1")
+    assert response.status_code == 502
+    assert response.json()["error"] == "ORIGIN_ERROR"
+    assert app.get("/stats").json() == {"hits": 0, "misses": 0}
+
+
+def test_sample_app_캐시_끄기_원본_전송_오류도_502_ORIGIN_ERROR이고_misses는_0():
+    def broken(request):
+        raise httpx.ConnectError("origin down", request=request)
+
+    app = TestClient(create_sample_app(failing_cache(), mock_client(broken), ttl_s=60, use_cache=False))
+    response = app.get("/items/1")
+    assert response.status_code == 502
+    assert response.json()["error"] == "ORIGIN_ERROR"
+    assert app.get("/stats").json() == {"hits": 0, "misses": 0}
+
+
+def test_sample_app_캐시_끄기_원본이_NaN_본문을_주면_502_ORIGIN_ERROR이고_misses는_0():
+    origin = mock_client(
+        lambda request: httpx.Response(200, content=b"NaN", headers={"content-type": "application/json"})
+    )
+    app = TestClient(create_sample_app(failing_cache(), origin, ttl_s=60, use_cache=False))
+    response = app.get("/items/1")
+    assert response.status_code == 502
+    assert response.json()["error"] == "ORIGIN_ERROR"
+    assert app.get("/stats").json() == {"hits": 0, "misses": 0}
+
+
+def test_sample_app_캐시_끄기_원본이_JSON_아닌_200이면_502_ORIGIN_ERROR():
+    origin = mock_client(lambda request: httpx.Response(200, text="oops", headers={"content-type": "text/plain"}))
+    app = TestClient(create_sample_app(failing_cache(), origin, ttl_s=60, use_cache=False))
+    response = app.get("/items/1")
+    assert response.status_code == 502
+    assert response.json()["error"] == "ORIGIN_ERROR"
+
+
+@pytest.mark.parametrize("item_id", ["%2E", "%2E%2E"])
+def test_sample_app_캐시_끄기_점_id는_400_INVALID_ITEM_ID이고_원본_호출도_통계도_0(origin, item_id):
+    app = TestClient(create_sample_app(failing_cache(), origin, ttl_s=60, use_cache=False))
+    response = app.get("/items/" + item_id)
+    assert response.status_code == 400
+    assert response.json()["error"] == "INVALID_ITEM_ID"
+    assert origin_calls(origin) == 0
+    assert app.get("/stats").json() == {"hits": 0, "misses": 0}
+
+
+def test_sample_app_캐시_끄기_stats_reset하면_misses가_0으로_돌아와요(origin):
+    app = TestClient(create_sample_app(None, origin, ttl_s=60, use_cache=False))
+    app.get("/items/1")
+    assert app.post("/stats/reset").json() == {"hits": 0, "misses": 0}
+    assert app.get("/stats").json() == {"hits": 0, "misses": 0}
+
+
+def test_sample_app_use_cache를_안_주면_기본은_켜짐이라_두번째가_HIT(cache, origin):
+    app = TestClient(create_sample_app(cache, origin, ttl_s=60))
+    app.get("/items/1")
+    assert app.get("/items/1").headers["X-Cache"] == "HIT"
+
+
+
+# --- 모듈 수준 app의 환경변수 SAMPLE_USE_CACHE ---
+
+
+@pytest.mark.parametrize("value, expected", [("0", False), ("1", True), ("", True), ("false", True), ("00", True)])
+def test_use_cache_from_env_0만_False이고_나머지_값은_True(value, expected):
+    from sample_app.app import _use_cache_from_env
+
+    assert _use_cache_from_env({"SAMPLE_USE_CACHE": value}) is expected
+
+
+def test_use_cache_from_env_환경변수가_없으면_True():
+    from sample_app.app import _use_cache_from_env
+
+    assert _use_cache_from_env({}) is True
+
+
+@pytest.fixture
+def reload_sample_module(monkeypatch):
+    """httpx.Client를 가짜 전송으로 바꾼 채 sample_app.app을 다시 불러와요. 끝나면 원래 환경으로 되돌려 한 번 더 불러와요.
+
+    cache.test로 가는 요청은 기록하고 404를 주고, origin.test로 가는 요청은 200 JSON을 줘요.
+    """
+    import importlib
+
+    import sample_app.app as module
+
+    real_client = httpx.Client
+    cache_requests = []
+
+    def handler(request):
+        if request.url.host == "cache.test":
+            cache_requests.append(str(request.url))
+            return httpx.Response(404, json={"error": "KEY_NOT_FOUND"})
+        return httpx.Response(200, json={"id": "1", "value": "item-1"})
+
+    def fake_client(*args, **kwargs):
+        return real_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    def reload_with(value):
+        monkeypatch.setenv("MINI_REDIS_URL", "http://cache.test")
+        monkeypatch.setenv("ORIGIN_URL", "http://origin.test")
+        if value is None:
+            monkeypatch.delenv("SAMPLE_USE_CACHE", raising=False)
+        else:
+            monkeypatch.setenv("SAMPLE_USE_CACHE", value)
+        monkeypatch.setattr(httpx, "Client", fake_client)
+        return importlib.reload(module), cache_requests
+
+    yield reload_with
+    monkeypatch.undo()
+    importlib.reload(module)
+
+
+def test_sample_app_환경변수_SAMPLE_USE_CACHE_0이면_모듈_app이_BYPASS이고_캐시는_안_건드려요(reload_sample_module):
+    module, cache_requests = reload_sample_module("0")
+    response = TestClient(module.app).get("/items/1")
+    assert response.status_code == 200
+    assert response.headers["X-Cache"] == "BYPASS"
+    assert cache_requests == []
+
+
+@pytest.mark.parametrize("value", ["1", None])
+def test_sample_app_환경변수가_1이거나_없으면_모듈_app은_캐시를_먼저_물어봐요(reload_sample_module, value):
+    module, cache_requests = reload_sample_module(value)
+    response = TestClient(module.app).get("/items/1")
+    assert response.headers["X-Cache"] == "MISS"
+    assert len(cache_requests) >= 1
