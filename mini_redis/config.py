@@ -11,6 +11,9 @@ EXPIRE_TICK_MS = 100
 EXPIRE_MAX_PER_TICK = 1000
 WHEEL_L1_SLOTS, WHEEL_L1_MS = 64, 100
 WHEEL_L2_SLOTS, WHEEL_L2_MS = 64, 6400
+# overflow 힙에서 휠로 tick당 옮기는 최대 개수. 삭제 상한과 같은 크기로 락 점유를 묶는다.
+# 1,000 x 4,096 tick(2단 한 바퀴) = 409만 개 > MAX_KEYS라 키 100만 개가 한 구간에 몰려도 100초면 다 옮긴다.
+WHEEL_OVERFLOW_MOVE_PER_TICK = 1000
 
 LEASE_TTL_MS = 10_000
 LEASE_RETRY_MS = 100  # lease 대기자에게 주는 retry_after_ms. 보유자가 원본(200ms)을 부르는 동안 두세 번 다시 묻는 간격

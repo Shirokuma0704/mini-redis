@@ -40,7 +40,7 @@ python -m bench.expiry_reclaim --keys 1000000 --seconds 120
 
 - **spread**: lazy만 쓰면 읽히지 않는 90%가 그대로 쌓여 70초에 90,606개가 남는다. 휠은 언제 재도 최근 100ms 안에 만료된 키(140~196개)만 남고, 마지막 만료(60초) 뒤에는 0이다.
 - **burst**: 10초에 99,901개가 한꺼번에 만료된다. 휠은 tick당 1,000개 상한 때문에 1초에 1만 개씩 지워 20초에 0이 된다. lazy만은 70초에도 90,028개가 남는다.
-- **tick 소요 시간**: 1,000개를 지우는 tick은 약 2ms다. 결과 파일의 tick 최대(이 컴퓨터에서 spread 약 12ms, burst는 실행마다 25~80ms)는 2단 슬롯을 1단으로 내려보내는 tick에서 나온다. burst는 10만 개를 한 tick에 옮기면서 락을 수십 ms 잡는다. tick당 상한은 삭제에만 걸리고 내려보내기에는 걸리지 않는다.
+- **tick 소요 시간**: 1,000개를 지우는 tick은 약 2ms다. 처음(#21)에는 2단 슬롯을 1단으로 내려보내는 tick이 항목마다 다시 넣느라 burst에서 락을 25~80ms 잡았다. #45에서 내려보내기를 칸째 옮기기로, overflow 이동을 tick당 1,000개로 바꾼 뒤로는 tick 최대가 spread 약 0.7ms, burst 약 2.5ms(1,000개를 지우는 tick)다.
 
 그래프는 [results/expiry_reclaim.md](results/expiry_reclaim.md)에 있다.
 
