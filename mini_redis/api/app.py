@@ -36,8 +36,8 @@ class RawPathMiddleware:
         await self.app(scope, receive, send)
 
 
-def _error(status: int, code: str, message: str) -> JSONResponse:
-    return JSONResponse(status_code=status, content={"error": code, "message": message})
+def _error(status: int, code: str, message: str, **extra) -> JSONResponse:
+    return JSONResponse(status_code=status, content={"error": code, "message": message, **extra})
 
 
 def create_app(store: Store | None = None) -> FastAPI:
@@ -58,7 +58,7 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.exception_handler(MiniRedisError)
     async def _mini_redis_error(_: Request, exc: MiniRedisError):
-        return _error(exc.status, exc.code, exc.message)
+        return _error(exc.status, exc.code, exc.message, **exc.extra)
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(_: Request, exc: StarletteHTTPException):

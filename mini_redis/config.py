@@ -13,6 +13,7 @@ WHEEL_L1_SLOTS, WHEEL_L1_MS = 64, 100
 WHEEL_L2_SLOTS, WHEEL_L2_MS = 64, 6400
 
 LEASE_TTL_MS = 10_000
+LEASE_RETRY_MS = 100  # lease 대기자에게 주는 retry_after_ms. 보유자가 원본(200ms)을 부르는 동안 두세 번 다시 묻는 간격
 
 AOF_FSYNC_INTERVAL_S = 1
 SNAPSHOT_INTERVAL_S = 300

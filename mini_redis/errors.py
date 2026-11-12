@@ -5,9 +5,10 @@ class MiniRedisError(Exception):
     status = 500
     code = "INTERNAL_ERROR"
 
-    def __init__(self, message: str = ""):
+    def __init__(self, message: str = "", **extra):
         super().__init__(message)
         self.message = message
+        self.extra = extra  # 응답 객체에 덧붙일 필드 (lease, retry_after_ms)
 
 
 class InvalidKey(MiniRedisError):
@@ -60,8 +61,13 @@ class InvalidBody(MiniRedisError):
     code = "INVALID_BODY"
 
 
+class LeaseInvalid(MiniRedisError):
+    status = 409
+    code = "LEASE_INVALID"
+
+
 class NotImplementedYet(MiniRedisError):
-    """아직 구현되지 않은 명령 (TTL/EXPIRE는 #7, lease는 #10, 네임스페이스는 #11)."""
+    """아직 구현되지 않은 명령 (네임스페이스는 #11)."""
 
     status = 501
     code = "NOT_IMPLEMENTED"

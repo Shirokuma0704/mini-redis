@@ -267,14 +267,14 @@ def test_expire_invalid_or_missing_ttl_returns_400_invalid_ttl_and_keeps_key(cli
 # --- 아직 구현 전인 명령은 조용히 무시하지 않고 거절 ---
 
 
-@pytest.mark.parametrize("url", ["/keys/a?lease=1", "/keys/a?ns=user", "/keys/a?v=7"])
-def test_get_with_lease_or_namespace_returns_501(client, url):
+@pytest.mark.parametrize("url", ["/keys/a?ns=user", "/keys/a?v=7", "/keys/a?ns=user&lease=1"])
+def test_get_with_namespace_returns_501(client, url):
     assert client.get(url).status_code == 501
 
 
-def test_put_with_lease_token_or_namespace_returns_501_and_stores_nothing(client, store):
-    assert client.put("/keys/a", json={"value": "1", "lease": "tok"}).status_code == 501
-    assert client.put("/keys/a?ns=user", json={"value": "1", "ttl": 5}).status_code == 501
+@pytest.mark.parametrize("url", ["/keys/a?ns=user", "/keys/a?v=7"])
+def test_put_with_namespace_returns_501_and_stores_nothing(client, store, url):
+    assert client.put(url, json={"value": "1", "ttl": 5}).status_code == 501
     assert store.size() == 0
 
 
@@ -291,7 +291,7 @@ def test_wrong_method_returns_405_in_error_format(client):
 
 
 def test_unexpected_exception_returns_500_in_error_format(client, store, monkeypatch):
-    monkeypatch.setattr(store, "get", lambda key: 1 / 0)
+    monkeypatch.setattr(store, "get", lambda key, lease=False: 1 / 0)
     r = client.get("/keys/a")
     assert (r.status_code, err(r)) == (500, "INTERNAL_ERROR")
 
