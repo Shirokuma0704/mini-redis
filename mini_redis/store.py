@@ -5,6 +5,7 @@ API -> Store -> HashTable 순서로만 호출한다. 락을 잡는 곳은 Store�
 (Redis의 명령 직렬 실행과 같은 효과). 디스크 I/O는 절대 락 안에서 하지 않는다.
 """
 import functools
+import re
 import threading
 from dataclasses import dataclass
 
@@ -15,6 +16,7 @@ from .errors import (
     InvalidKey,
     InvalidValue,
     KeyNotFound,
+    NotInteger,
     ValueTooLarge,
 )
 from .hashtable import HashTable
@@ -51,6 +53,21 @@ def validate_value(value) -> None:
         raise InvalidValue("값은 문자열이어야 합니다")
     if len(value.encode("utf-8", errors="surrogatepass")) > MAX_VALUE_BYTES:
         raise ValueTooLarge(f"값은 {MAX_VALUE_BYTES}바이트 이하여야 합니다")
+
+
+INT64_MIN = -(2**63)
+INT64_MAX = 2**63 - 1
+_INT_RE = re.compile(r"-?[0-9]{1,20}")  # ASCII 10진수만. int()는 공백·밑줄·전각숫자도 받아서 쓰지 않는다
+
+
+def parse_int64(text: str) -> int:
+    """10진 정수 문자열을 int로. 아니거나 64비트 범위 밖이면 NotInteger(409)."""
+    if not _INT_RE.fullmatch(text):
+        raise NotInteger("값이 10진 정수가 아닙니다")
+    n = int(text)
+    if not INT64_MIN <= n <= INT64_MAX:
+        raise NotInteger("값이 64비트 정수 범위를 벗어납니다")
+    return n
 
 
 @dataclass(frozen=True)
@@ -141,3 +158,27 @@ class Store:
     def exists(self, key: str) -> bool:
         validate_key(key)
         return self._get_live(key) is not None
+
+    @locked
+    def incr(self, key: str, amount: int = 1) -> int:
+        """값을 10진 정수로 보고 amount만큼 더한 결과를 돌려준다.
+
+        - 없는(또는 만료된) 키는 0에서 시작하고 TTL 없는 새 키가 된다.
+        - 기존 키의 TTL은 그대로 유지한다 (Redis와 동일).
+        - 정수가 아니거나 결과가 64비트를 넘으면 NotInteger(409), 값은 바뀌지 않는다.
+        읽기와 쓰기가 한 번의 락 안에서 일어나서 동시 호출에도 합이 맞는다.
+        """
+        validate_key(key)
+        if isinstance(amount, bool) or not isinstance(amount, int):
+            raise InvalidValue("amount는 정수여야 합니다")
+        entry = self._get_live(key)
+        if entry is None:
+            self._check_capacity(key)
+            current, expire_at_ms = 0, None
+        else:
+            current, expire_at_ms = parse_int64(entry.value), entry.expire_at_ms
+        result = current + amount
+        if not INT64_MIN <= result <= INT64_MAX:
+            raise NotInteger("결과가 64비트 정수 범위를 벗어납니다")
+        self._table.put(key, str(result), expire_at_ms)
+        return result

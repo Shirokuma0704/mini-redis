@@ -33,3 +33,8 @@ class InvalidValue(MiniRedisError):
 class KeyNotFound(MiniRedisError):
     status = 404
     code = "KEY_NOT_FOUND"
+
+
+class NotInteger(MiniRedisError):
+    status = 409
+    code = "NOT_INTEGER"
