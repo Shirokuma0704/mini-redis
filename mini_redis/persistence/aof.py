@@ -79,6 +79,10 @@ def decode_line(line: str) -> dict[str, Any]:
     return record
 
 
+class AofBrokenError(RuntimeError):
+    """롤백까지 실패해서 AOF 파일 끝이 깨졌을 수 있을 때 던져요. 더 적지 않고 멈춰요."""
+
+
 class AofWriter:
     """AOF 줄을 메모리 버퍼에 모아 두었다가 파일에 적어요.
 
@@ -93,28 +97,40 @@ class AofWriter:
     ) -> None:
         self.path = path
         self._interval_s = interval_s
-        self._buffer: list[str] = []
+        self._buffer: list[bytes] = []
         self._buffer_lock = threading.Lock()  # 버퍼를 바꿔 끼울 때만 잡아요.
         self._write_lock = threading.Lock()  # flush끼리 순서가 섞이지 않게 해요.
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self.last_error: BaseException | None = None  # 마지막 flush가 실패했다면 그 예외예요.
+        # 롤백(truncate)까지 실패하면 파일 끝이 깨진 채 남아요. 이때부터는 더 적지 않아요.
+        self.broken: bool = False
+        self.rollback_error: BaseException | None = None  # 롤백이 실패했을 때 그 예외예요.
 
     def append(self, record: dict[str, Any]) -> None:
-        """레코드를 한 줄로 바꿔 버퍼에 더해요. 파일은 건드리지 않아요."""
-        line = encode_record(record)
+        """레코드를 한 줄 바이트로 바꿔 버퍼에 더해요. 파일은 건드리지 않아요.
+
+        인코딩을 여기서 미리 해요. flush에서 실패하면 들고 나간 줄들이 통째로 사라질 수 있어서,
+        못 쓰는 레코드는 append 단계에서 바로 예외로 돌려줘요.
+        """
+        if self.broken:
+            raise AofBrokenError("AOF 파일이 깨진 상태라 더 적을 수 없어요")
+        line = encode_record(record).encode("utf-8")
         with self._buffer_lock:
             self._buffer.append(line)
 
     def flush(self) -> int:
         """버퍼를 파일에 적고 fsync해요. 적은 줄 수를 돌려줘요."""
         with self._write_lock:
+            if self.broken:
+                # 파일을 열지도, 버퍼를 건드리지도 않고 바로 멈춰요.
+                raise AofBrokenError("AOF 파일이 깨진 상태라 더 적을 수 없어요")
             # 바꿔 끼우는 것도 쓰기 락 안에서 해야 나중 줄이 먼저 적히지 않아요.
             with self._buffer_lock:
                 lines, self._buffer = self._buffer, []
             if not lines:
                 return 0
-            data = "".join(lines).encode("utf-8")
+            data = b"".join(lines)
             try:
                 with open(self.path, "ab") as f:
                     start_size = f.tell()  # 이번 시도 전 파일 크기예요.
@@ -126,8 +142,11 @@ class AofWriter:
                         # 반쯤 쓴 바이트가 남지 않게 원래 크기로 잘라 내요.
                         try:
                             f.truncate(start_size)
-                        except Exception:
-                            pass  # 처음 에러가 더 중요해서 이 에러는 무시해요.
+                        except Exception as truncate_error:
+                            # 잘라 내지 못하면 다시 써도 안전하지 않아서 깨진 상태로 표시해요.
+                            # 처음 에러가 더 중요해서 그대로 던지고, 이 에러는 따로 남겨 둬요.
+                            self.rollback_error = truncate_error
+                            self.broken = True
                         raise
             except Exception as error:
                 # 들고 나간 줄을 버퍼 맨 앞에 되돌려서 다음 flush가 먼저 적게 해요.
