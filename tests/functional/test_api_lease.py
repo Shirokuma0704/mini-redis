@@ -87,3 +87,62 @@ def test_get_lease_param_false_miss_issues_nothing(client, q):
 def test_get_lease_param_not_boolean_returns_400(client):
     r = client.get("/keys/k?lease=abc")
     assert r.status_code == 400
+
+
+# --- XFetch: 만료 직전 히트 하나에 조기 갱신용 lease ---
+
+def _api_with_forced_draw(clock, value):
+    from fastapi.testclient import TestClient
+
+    from mini_redis.api.app import create_app
+    from mini_redis.store import Store
+
+    rng = type("Rng", (), {"value": value, "__call__": lambda self: self.value})()
+    store = Store(clock=clock, random_fn=rng)
+    return TestClient(create_app(store), raise_server_exceptions=False), rng
+
+
+def _fill(client, clock, key="hot", ttl=1, work_ms=200):
+    miss = client.get(f"/keys/{key}", params={"lease": 1})
+    assert miss.status_code == 404
+    clock.advance(work_ms)
+    r = client.put(f"/keys/{key}", json={"value": "v1", "ttl": ttl, "lease": miss.json()["lease"]})
+    assert r.status_code == 200
+
+
+def test_get_hit_lease_near_expiry_returns_200_with_value_and_lease(clock):
+    client, rng = _api_with_forced_draw(clock, 0.999999)
+    _fill(client, clock)
+    clock.advance(500)
+    r = client.get("/keys/hot", params={"lease": 1})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["value"] == "v1"
+    assert isinstance(body["lease"], str) and len(body["lease"]) == 16
+    assert client.get("/keys/hot", params={"lease": 1}).json().get("lease") is None  # 한 명만
+
+
+def test_get_hit_lease_with_losing_draw_has_no_lease_field(clock):
+    client, rng = _api_with_forced_draw(clock, 0.0)
+    _fill(client, clock)
+    clock.advance(500)
+    assert "lease" not in client.get("/keys/hot", params={"lease": 1}).json()
+
+
+def test_get_hit_without_lease_param_has_no_lease_field_even_if_forced(clock):
+    client, rng = _api_with_forced_draw(clock, 0.999999)
+    _fill(client, clock)
+    clock.advance(500)
+    assert "lease" not in client.get("/keys/hot").json()
+
+
+def test_early_refresh_put_over_http_extends_ttl_and_old_token_is_spent(clock):
+    client, rng = _api_with_forced_draw(clock, 0.999999)
+    _fill(client, clock)
+    clock.advance(500)
+    token = client.get("/keys/hot", params={"lease": 1}).json()["lease"]
+    clock.advance(150)
+    assert client.put("/keys/hot", json={"value": "v2", "ttl": 60, "lease": token}).status_code == 200
+    assert client.get("/keys/hot").json() == {"value": "v2", "ttl": 60}
+    r = client.put("/keys/hot", json={"value": "v3", "ttl": 60, "lease": token})
+    assert (r.status_code, r.json()["error"]) == (409, "LEASE_INVALID")

@@ -15,6 +15,8 @@ WHEEL_L2_SLOTS, WHEEL_L2_MS = 64, 6400
 LEASE_TTL_MS = 10_000
 LEASE_RETRY_MS = 100  # lease 대기자에게 주는 retry_after_ms. 보유자가 원본(200ms)을 부르는 동안 두세 번 다시 묻는 간격
 
+XFETCH_BETA = 1.0  # 클수록 만료 전에 더 일찍 갱신을 시작한다 (논문 기본값 1)
+
 AOF_FSYNC_INTERVAL_S = 1
 SNAPSHOT_INTERVAL_S = 300
 SNAPSHOT_AOF_MAX_BYTES = 10 * 1024 * 1024

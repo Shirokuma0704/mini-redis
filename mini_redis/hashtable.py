@@ -20,12 +20,13 @@ def fnv1a_64(key: str) -> int:
 
 
 class Entry:
-    __slots__ = ("key", "value", "expire_at_ms", "next")
+    __slots__ = ("key", "value", "expire_at_ms", "delta_ms", "next")
 
-    def __init__(self, key, value, expire_at_ms=None, next=None):
+    def __init__(self, key, value, expire_at_ms=None, next=None, delta_ms=None):
         self.key = key
         self.value = value
         self.expire_at_ms = expire_at_ms  # None이면 무기한
+        self.delta_ms = delta_ms  # 값을 다시 만드는 데 걸린 시간(XFetch용 힌트). 영속화하지 않는다
         self.next = next
 
 
@@ -57,7 +58,7 @@ class HashTable:
             node = node.next
         return None
 
-    def put(self, key, value, expire_at_ms=None) -> bool:
+    def put(self, key, value, expire_at_ms=None, delta_ms=None) -> bool:
         """있으면 값과 만료 시각을 교체, 없으면 체인 머리에 삽입.
 
         새 키가 들어갔으면 True, 덮어썼으면 False.
@@ -68,9 +69,10 @@ class HashTable:
             if node.key == key:
                 node.value = value
                 node.expire_at_ms = expire_at_ms
+                node.delta_ms = delta_ms
                 return False
             node = node.next
-        self._buckets[idx] = Entry(key, value, expire_at_ms, self._buckets[idx])
+        self._buckets[idx] = Entry(key, value, expire_at_ms, self._buckets[idx], delta_ms)
         self._size += 1
         if self._size / len(self._buckets) > LOAD_FACTOR:
             self._resize()
