@@ -10,9 +10,11 @@ import threading
 from dataclasses import dataclass
 
 from .clock import system_clock_ms
-from .config import MAX_KEY_BYTES, MAX_KEYS, MAX_VALUE_BYTES
+from .config import EXPIRE_TICK_MS, MAX_KEY_BYTES, MAX_KEYS, MAX_VALUE_BYTES
 from .errors import (
     CapacityExceeded,
+    ConfirmRequired,
+    EmptyPrefix,
     InvalidKey,
     InvalidValue,
     KeyNotFound,
@@ -20,6 +22,7 @@ from .errors import (
     ValueTooLarge,
 )
 from .hashtable import HashTable
+from .timing_wheel import TimingWheel, start_expiry_thread
 
 
 def locked(method):
@@ -70,6 +73,11 @@ def parse_int64(text: str) -> int:
     return n
 
 
+def _validate_prefix(prefix) -> None:
+    if not isinstance(prefix, str):
+        raise InvalidValue("prefix는 문자열이어야 합니다")
+
+
 @dataclass(frozen=True)
 class Item:
     """GET 결과. 엔트리 자체(가변)를 락 밖으로 내보내지 않으려고 복사해서 돌려준다."""
@@ -89,6 +97,8 @@ class Store:
         self._max_keys = max_keys
         self._lock = threading.RLock()
         self._table = HashTable()
+        self._wheel = TimingWheel(self._clock())
+        self._expiry_stop = None  # 만료 스레드를 멈추는 Event
 
     # --- 내부 도우미 (호출하는 공개 메서드가 락을 이미 잡고 있다) ---
 
@@ -99,6 +109,29 @@ class Store:
         """새 키를 넣을 때만 상한을 검사한다 (덮어쓰기는 키 수가 늘지 않는다)."""
         if self._table.get(key) is None and self._table.size >= self._max_keys:
             raise CapacityExceeded(f"키 개수 상한({self._max_keys})을 초과했습니다")
+
+    def _schedule_expiry(self, key: str, old_expire_at_ms, new_expire_at_ms) -> None:
+        """휠에 (key, 만료 시각)을 등록한다. 낡은 항목이 쌓이지 않게 필요할 때만 add한다.
+
+        새 만료가 생기거나 기존보다 앞당겨질 때만 add한다. 기존 만료보다 늦춰지는 경우는
+        기존 항목이 먼저 꺼내질 때 _delete_if_current가 새 시각으로 다시 등록한다.
+        """
+        if new_expire_at_ms is None:
+            return
+        if old_expire_at_ms is None or new_expire_at_ms < old_expire_at_ms:
+            self._wheel.add(key, new_expire_at_ms)
+
+    def _delete_if_current(self, key: str, expire_at_ms: int) -> bool:
+        """휠이 꺼낸 항목의 콜백. 엔트리의 현재 만료 시각이 같을 때만 지운다."""
+        entry = self._table.get(key)
+        if entry is None or entry.expire_at_ms is None:
+            return False
+        if entry.expire_at_ms == expire_at_ms:
+            self._table.delete(key)
+            return True
+        if entry.expire_at_ms > expire_at_ms:
+            self._wheel.add(key, entry.expire_at_ms)  # 만료가 늦춰졌다: 새 시각으로 재등록
+        return False
 
     def _get_live(self, key: str):
         """살아 있는 엔트리를 돌려준다. 만료됐으면 그 자리에서 지우고 None (lazy 만료).
@@ -133,9 +166,11 @@ class Store:
         """
         validate_key(key)
         validate_value(value)
-        self._get_live(key)  # 같은 키의 만료된 옛 엔트리는 새 키로 취급하려고 먼저 지운다
+        old = self._get_live(key)  # 같은 키의 만료된 옛 엔트리는 새 키로 취급하려고 먼저 지운다
         self._check_capacity(key)
+        old_expire_at_ms = old.expire_at_ms if old is not None else None
         self._table.put(key, value, expire_at_ms)
+        self._schedule_expiry(key, old_expire_at_ms, expire_at_ms)
 
     @locked
     def get(self, key: str) -> Item:
@@ -182,3 +217,71 @@ class Store:
             raise NotInteger("결과가 64비트 정수 범위를 벗어납니다")
         self._table.put(key, str(result), expire_at_ms)
         return result
+
+    @locked
+    def keys(self, prefix: str = "") -> list[str]:
+        """prefix로 시작하는 살아 있는 키 목록 (정렬). 빈 prefix는 전체.
+
+        O(capacity + n)이고 락을 끝까지 잡는다. 순회 중 만나는 만료 키는 지운다.
+        """
+        _validate_prefix(prefix)
+        return sorted(self._live_keys_with_prefix(prefix))
+
+    @locked
+    def delete_prefix(self, prefix: str) -> int:
+        """prefix로 시작하는 키를 모두 지우고 살아 있던 키의 개수를 돌려준다.
+
+        원자성을 위해 락을 끝까지 잡는다 (O(N), 키 상한 안에서 멈춤은 감수).
+        빈 prefix는 EmptyPrefix(400) — 전체 삭제는 flush를 쓴다.
+        """
+        _validate_prefix(prefix)
+        if prefix == "":
+            raise EmptyPrefix("빈 prefix로는 지울 수 없습니다 (전체 삭제는 FLUSH)")
+        victims = self._live_keys_with_prefix(prefix)
+        for key in victims:
+            self._table.delete(key)
+        return len(victims)
+
+    @locked
+    def flush(self, confirm: bool = False) -> None:
+        """모든 키를 지운다. 새 해시테이블과 타이밍 휠로 참조를 바꿔 끼우므로 O(1)이다.
+
+        옛 테이블과 휠은 가비지 컬렉터가 치운다. 실수로 호출하지 못하게 confirm=True가 필요하다.
+        """
+        if confirm is not True:
+            raise ConfirmRequired("FLUSH는 confirm=true가 필요합니다")
+        self._table = HashTable()
+        self._wheel = TimingWheel(self._now_ms())
+
+    def _live_keys_with_prefix(self, prefix: str) -> list[str]:
+        """호출하는 메서드가 락을 잡고 있다. 만료된 키는 지우고 목록에서 뺀다."""
+        now = self._now_ms()
+        live = []
+        for entry in self._table.items():
+            if not entry.key.startswith(prefix):
+                continue
+            if entry.expire_at_ms is not None and now >= entry.expire_at_ms:
+                self._table.delete(entry.key)
+                continue
+            live.append(entry.key)
+        return live
+
+    @locked
+    def expire_tick(self) -> int:
+        """만료된 키를 휠에서 꺼내 지운다 (tick당 최대 EXPIRE_MAX_PER_TICK개). 지운 개수 반환.
+
+        만료 스레드가 EXPIRE_TICK_MS마다 부른다. 락은 이 안에서만 잡고, 남은 항목은 다음 tick으로 넘긴다.
+        """
+        return self._wheel.expire(self._now_ms(), self._delete_if_current)
+
+    def start_expiry(self, interval_ms: int = EXPIRE_TICK_MS) -> None:
+        """백그라운드 만료 스레드를 시작한다. 복구가 끝난 뒤에 불러야 한다. 이미 돌고 있으면 무시."""
+        with self._lock:
+            if self._expiry_stop is None:
+                self._expiry_stop = start_expiry_thread(self.expire_tick, interval_ms)
+
+    def stop_expiry(self) -> None:
+        with self._lock:
+            stop, self._expiry_stop = self._expiry_stop, None
+        if stop is not None:
+            stop.set()
