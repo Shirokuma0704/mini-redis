@@ -6,10 +6,17 @@ API -> Store -> HashTable 순서로만 호출한다. 락을 잡는 곳은 Store�
 """
 import functools
 import threading
+from dataclasses import dataclass
 
 from .clock import system_clock_ms
 from .config import MAX_KEY_BYTES, MAX_KEYS, MAX_VALUE_BYTES
-from .errors import CapacityExceeded, InvalidKey, InvalidValue, ValueTooLarge
+from .errors import (
+    CapacityExceeded,
+    InvalidKey,
+    InvalidValue,
+    KeyNotFound,
+    ValueTooLarge,
+)
 from .hashtable import HashTable
 
 
@@ -46,6 +53,14 @@ def validate_value(value) -> None:
         raise ValueTooLarge(f"값은 {MAX_VALUE_BYTES}바이트 이하여야 합니다")
 
 
+@dataclass(frozen=True)
+class Item:
+    """GET 결과. 엔트리 자체(가변)를 락 밖으로 내보내지 않으려고 복사해서 돌려준다."""
+
+    value: str
+    expire_at_ms: int | None  # None이면 무기한
+
+
 class Store:
     def __init__(
         self,
@@ -68,6 +83,19 @@ class Store:
         if self._table.get(key) is None and self._table.size >= self._max_keys:
             raise CapacityExceeded(f"키 개수 상한({self._max_keys})을 초과했습니다")
 
+    def _get_live(self, key: str):
+        """살아 있는 엔트리를 돌려준다. 만료됐으면 그 자리에서 지우고 None (lazy 만료).
+
+        "만료됨"과 "원래 없음"은 구분하지 않는다.
+        """
+        entry = self._table.get(key)
+        if entry is None:
+            return None
+        if entry.expire_at_ms is not None and self._now_ms() >= entry.expire_at_ms:
+            self._table.delete(key)
+            return None
+        return entry
+
     # --- 공개 메서드 ---
 
     @locked
@@ -78,3 +106,38 @@ class Store:
     def size(self) -> int:
         """저장된 엔트리 수 (만료됐지만 아직 회수되지 않은 키 포함)."""
         return self._table.size
+
+    @locked
+    def set(self, key: str, value: str, expire_at_ms: int | None = None) -> None:
+        """키를 저장한다. 이미 있으면 값과 만료 시각을 통째로 교체한다.
+
+        expire_at_ms를 안 주면 기존 TTL도 사라진다 (Redis와 동일).
+        TTL(초) -> 절대 시각 변환과 INVALID_TTL 검증은 TTL 이슈(#7)에서 한다.
+        """
+        validate_key(key)
+        validate_value(value)
+        self._get_live(key)  # 같은 키의 만료된 옛 엔트리는 새 키로 취급하려고 먼저 지운다
+        self._check_capacity(key)
+        self._table.put(key, value, expire_at_ms)
+
+    @locked
+    def get(self, key: str) -> Item:
+        """없거나 만료됐으면 KeyNotFound(404)."""
+        validate_key(key)
+        entry = self._get_live(key)
+        if entry is None:
+            raise KeyNotFound(f"키 '{key}'가 없습니다")
+        return Item(entry.value, entry.expire_at_ms)
+
+    @locked
+    def delete(self, key: str) -> bool:
+        """지웠으면 True, 원래 없었으면 False (에러 아님, 키가 새로 생기지 않는다)."""
+        validate_key(key)
+        if self._get_live(key) is None:
+            return False
+        return self._table.delete(key)
+
+    @locked
+    def exists(self, key: str) -> bool:
+        validate_key(key)
+        return self._get_live(key) is not None

@@ -28,3 +28,8 @@ class CapacityExceeded(MiniRedisError):
 class InvalidValue(MiniRedisError):
     status = 400
     code = "INVALID_VALUE"
+
+
+class KeyNotFound(MiniRedisError):
+    status = 404
+    code = "KEY_NOT_FOUND"
