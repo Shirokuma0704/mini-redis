@@ -59,11 +59,11 @@ def _parse_ttl(value) -> int:
     return value
 
 
-def _reject_unsupported(request: Request, body: dict | None = None) -> None:
-    """lease(#10)와 네임스페이스(#11)가 구현되기 전까지는 조용히 무시하지 않고 거절한다."""
+def _reject_unsupported(request: Request) -> None:
+    """네임스페이스(#11)가 구현되기 전까지는 조용히 무시하지 않고 거절한다."""
     q = request.query_params
-    if "ns" in q or "v" in q or "lease" in q or (body and "lease" in body):
-        raise NotImplementedYet("lease와 네임스페이스(ns, v)는 아직 지원하지 않습니다")
+    if "ns" in q or "v" in q:
+        raise NotImplementedYet("네임스페이스(ns, v)는 아직 지원하지 않습니다")
 
 
 @router.get("/health")
@@ -75,20 +75,21 @@ def health():
 
 @router.put("/keys/{key}")
 def set_key(key: str, request: Request, body: dict = Depends(json_body), store: Store = Depends(get_store)):
-    _reject_unsupported(request, body)
+    _reject_unsupported(request)
     key = decode_key(key)
     value = body.get("value")
     expire_at_ms = None
     if body.get("ttl") is not None:
         expire_at_ms = store.now_ms() + _parse_ttl(body["ttl"]) * 1000
-    store.set(key, value, expire_at_ms)
+    store.set(key, value, expire_at_ms, lease=body.get("lease"))
     return {"ok": True}
 
 
 @router.get("/keys/{key}")
-def get_key(key: str, request: Request, store: Store = Depends(get_store)):
+def get_key(key: str, request: Request, lease: bool = Query(False), store: Store = Depends(get_store)):
+    """?lease=1이면 miss의 404에 lease 토큰이나 retry_after_ms가 붙는다 (Store.get)."""
     _reject_unsupported(request)
-    item = store.get(decode_key(key))
+    item = store.get(decode_key(key), lease=lease)
     return {"value": item.value, "ttl": _remaining_seconds(store, item.expire_at_ms)}
 
 

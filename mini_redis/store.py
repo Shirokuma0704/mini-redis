@@ -19,10 +19,12 @@ from .errors import (
     InvalidTtl,
     InvalidValue,
     KeyNotFound,
+    LeaseInvalid,
     NotInteger,
     ValueTooLarge,
 )
 from .hashtable import HashTable
+from .lease import LeaseTable
 from .timing_wheel import TimingWheel, start_expiry_thread
 
 
@@ -107,6 +109,7 @@ class Store:
         self._lock = threading.RLock()
         self._table = HashTable()
         self._wheel = TimingWheel(self._clock())
+        self._leases = LeaseTable()
         self._expiry_stop = None  # 만료 스레드를 멈추는 Event
 
     # --- 내부 도우미 (호출하는 공개 메서드가 락을 이미 잡고 있다) ---
@@ -167,33 +170,57 @@ class Store:
         return self._table.size
 
     @locked
-    def set(self, key: str, value: str, expire_at_ms: int | None = None) -> None:
+    def set(self, key: str, value: str, expire_at_ms: int | None = None, lease: str | None = None) -> None:
         """키를 저장한다. 이미 있으면 값과 만료 시각을 통째로 교체한다.
 
         expire_at_ms를 안 주면 기존 TTL도 사라진다 (Redis와 동일).
         TTL(초) -> 절대 시각 변환과 INVALID_TTL 검증은 API(routes._parse_ttl)가 한다.
+        lease를 주면 그 키의 살아 있는 lease 토큰과 같아야 저장하고 lease를 지운다.
+        없거나 만료·무효화됐거나 다르면 LeaseInvalid(409)이고 아무것도 바꾸지 않는다.
+        lease 없는 쓰기는 일반 쓰기로 받고, 진행 중인 lease는 무효화한다.
         """
         validate_key(key)
         validate_value(value)
+        if lease is not None and not isinstance(lease, str):
+            raise InvalidValue("lease는 문자열이어야 합니다")
         old = self._get_live(key)  # 같은 키의 만료된 옛 엔트리는 새 키로 취급하려고 먼저 지운다
         self._check_capacity(key)
+        if lease is None:
+            # 늦게 오는 lease PUT이 이 값보다 낡은 원본으로 덮어쓰지 못하게 한다
+            self._leases.drop(key)
+        elif not self._leases.consume(key, lease, self._now_ms()):
+            raise LeaseInvalid("lease가 없거나 만료·무효화됐습니다. 다시 GET ?lease=1을 하세요")
         old_expire_at_ms = old.expire_at_ms if old is not None else None
         self._table.put(key, value, expire_at_ms)
         self._schedule_expiry(key, old_expire_at_ms, expire_at_ms)
 
     @locked
-    def get(self, key: str) -> Item:
-        """없거나 만료됐으면 KeyNotFound(404)."""
+    def get(self, key: str, lease: bool = False) -> Item:
+        """없거나 만료됐으면 KeyNotFound(404).
+
+        lease=True면 miss일 때 그 404에 새 lease 토큰(`lease`)을 붙인다. 같은 키에 살아 있는
+        lease가 있으면 토큰 대신 `retry_after_ms`를 붙인다. 확인과 발급이 한 락 안이라 토큰은 하나만 나간다.
+        """
         validate_key(key)
         entry = self._get_live(key)
-        if entry is None:
-            raise KeyNotFound(f"키 '{key}'가 없습니다")
-        return Item(entry.value, entry.expire_at_ms)
+        if entry is not None:
+            return Item(entry.value, entry.expire_at_ms)
+        message = f"키 '{key}'가 없습니다"
+        if not lease:
+            raise KeyNotFound(message)
+        token, retry_after_ms = self._leases.acquire(key, self._now_ms())
+        if token is not None:
+            raise KeyNotFound(message, lease=token)
+        raise KeyNotFound(message, retry_after_ms=retry_after_ms)
 
     @locked
     def delete(self, key: str) -> bool:
-        """지웠으면 True, 원래 없었으면 False (에러 아님, 키가 새로 생기지 않는다)."""
+        """지웠으면 True, 원래 없었으면 False (에러 아님, 키가 새로 생기지 않는다).
+
+        키가 없어도 lease는 무효화한다. lease 보유자가 원본을 읽는 사이 원본이 바뀌었다는 신호다.
+        """
         validate_key(key)
+        self._leases.drop(key)
         if self._get_live(key) is None:
             return False
         return self._table.delete(key)
@@ -224,6 +251,7 @@ class Store:
         result = current + amount
         if not INT64_MIN <= result <= INT64_MAX:
             raise NotInteger("결과가 64비트 정수 범위를 벗어납니다")
+        self._leases.drop(key)  # lease 없는 쓰기라 SET과 같이 진행 중인 lease를 무효화한다
         self._table.put(key, str(result), expire_at_ms)
         return result
 
@@ -283,6 +311,7 @@ class Store:
         _validate_prefix(prefix)
         if prefix == "":
             raise EmptyPrefix("빈 prefix로는 지울 수 없습니다 (전체 삭제는 FLUSH)")
+        self._leases.drop_prefix(prefix)  # 키가 아직 없는 lease도 무효화한다 (DEL과 같은 이유)
         victims = self._live_keys_with_prefix(prefix)
         for key in victims:
             self._table.delete(key)
@@ -290,7 +319,7 @@ class Store:
 
     @locked
     def flush(self, confirm: bool = False) -> None:
-        """모든 키를 지운다. 새 해시테이블과 타이밍 휠로 참조를 바꿔 끼우므로 O(1)이다.
+        """모든 키를 지운다. 새 해시테이블·타이밍 휠·lease 테이블로 참조를 바꿔 끼우므로 O(1)이다.
 
         옛 테이블과 휠은 가비지 컬렉터가 치운다. 실수로 호출하지 못하게 confirm=True가 필요하다.
         """
@@ -298,6 +327,7 @@ class Store:
             raise ConfirmRequired("FLUSH는 confirm=true가 필요합니다")
         self._table = HashTable()
         self._wheel = TimingWheel(self._now_ms())
+        self._leases = LeaseTable()
 
     def _live_keys_with_prefix(self, prefix: str) -> list[str]:
         """호출하는 메서드가 락을 잡고 있다. 만료된 키는 지우고 목록에서 뺀다."""
