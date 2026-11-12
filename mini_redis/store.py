@@ -5,12 +5,13 @@ API -> Store -> HashTable 순서로만 호출한다. 락을 잡는 곳은 Store�
 (Redis의 명령 직렬 실행과 같은 효과). 디스크 I/O는 절대 락 안에서 하지 않는다.
 """
 import functools
+import random
 import re
 import threading
 from dataclasses import dataclass
 
 from .clock import system_clock_ms
-from .config import EXPIRE_TICK_MS, MAX_KEY_BYTES, MAX_KEYS, MAX_VALUE_BYTES
+from .config import EXPIRE_TICK_MS, MAX_KEY_BYTES, MAX_KEYS, MAX_VALUE_BYTES, XFETCH_BETA
 from .errors import (
     CapacityExceeded,
     ConfirmRequired,
@@ -26,6 +27,7 @@ from .errors import (
 from .hashtable import HashTable
 from .lease import LeaseTable
 from .timing_wheel import TimingWheel, start_expiry_thread
+from .xfetch import should_refresh_early
 
 
 def locked(method):
@@ -95,6 +97,7 @@ class Item:
 
     value: str
     expire_at_ms: int | None  # None이면 무기한
+    lease: str | None = None  # 값은 있지만 이 요청이 조기 갱신을 맡았다는 표시 (XFetch)
 
 
 class Store:
@@ -102,10 +105,17 @@ class Store:
         self,
         clock=system_clock_ms,
         max_keys: int = MAX_KEYS,
+        random_fn=random.random,
+        xfetch_beta: float = XFETCH_BETA,
     ):
-        """clock: epoch ms를 돌려주는 함수. 테스트는 FakeClock을 넣는다."""
+        """clock: epoch ms를 돌려주는 함수. 테스트는 FakeClock을 넣는다.
+
+        random_fn: [0, 1) 난수를 돌려주는 함수. XFetch의 조기 갱신 추첨에 쓰며, 테스트는 고정값을 넣는다.
+        """
         self._clock = clock
         self._max_keys = max_keys
+        self._random = random_fn
+        self._xfetch_beta = xfetch_beta
         self._lock = threading.RLock()
         self._table = HashTable()
         self._wheel = TimingWheel(self._clock())
@@ -144,6 +154,21 @@ class Store:
         if entry.expire_at_ms > expire_at_ms:
             self._wheel.add(key, entry.expire_at_ms)  # 만료가 늦춰졌다: 새 시각으로 재등록
         return False
+
+    def _early_refresh_lease(self, key: str, entry) -> str | None:
+        """XFetch 추첨에 당첨되고 이 키에 살아 있는 lease가 없으면 새 lease 토큰을 돌려준다.
+
+        delta는 이 값을 마지막으로 lease 경로로 채울 때 잰 값이다. 없으면(처음 값이거나 lease 없이 쓴 값)
+        측정 근거가 없어서 조기 갱신을 하지 않는다. 이미 누군가 갱신 중이면(lease가 살아 있으면) None이다.
+        """
+        if entry.expire_at_ms is None or not entry.delta_ms:
+            return None
+        now = self._now_ms()
+        u = 1.0 - self._random()  # [0, 1) -> (0, 1]: ln(0)을 피한다
+        if not should_refresh_early(now, entry.expire_at_ms, entry.delta_ms, self._xfetch_beta, u):
+            return None
+        token, _ = self._leases.acquire(key, now)
+        return token
 
     def _get_live(self, key: str):
         """살아 있는 엔트리를 돌려준다. 만료됐으면 그 자리에서 지우고 None (lazy 만료).
@@ -185,13 +210,19 @@ class Store:
             raise InvalidValue("lease는 문자열이어야 합니다")
         old = self._get_live(key)  # 같은 키의 만료된 옛 엔트리는 새 키로 취급하려고 먼저 지운다
         self._check_capacity(key)
+        delta_ms = None
         if lease is None:
             # 늦게 오는 lease PUT이 이 값보다 낡은 원본으로 덮어쓰지 못하게 한다
             self._leases.drop(key)
-        elif not self._leases.consume(key, lease, self._now_ms()):
-            raise LeaseInvalid("lease가 없거나 만료·무효화됐습니다. 다시 GET ?lease=1을 하세요")
+        else:
+            now = self._now_ms()
+            issued_at = self._leases.issued_at(key, now)  # consume이 lease를 지우기 전에 읽는다
+            if not self._leases.consume(key, lease, now):
+                raise LeaseInvalid("lease가 없거나 만료·무효화됐습니다. 다시 GET ?lease=1을 하세요")
+            # lease 발급부터 PUT까지가 값을 다시 만드는 데 걸린 시간이다 (XFetch의 delta)
+            delta_ms = now - issued_at
         old_expire_at_ms = old.expire_at_ms if old is not None else None
-        self._table.put(key, value, expire_at_ms)
+        self._table.put(key, value, expire_at_ms, delta_ms)
         self._schedule_expiry(key, old_expire_at_ms, expire_at_ms)
 
     @locked
@@ -200,11 +231,16 @@ class Store:
 
         lease=True면 miss일 때 그 404에 새 lease 토큰(`lease`)을 붙인다. 같은 키에 살아 있는
         lease가 있으면 토큰 대신 `retry_after_ms`를 붙인다. 확인과 발급이 한 락 안이라 토큰은 하나만 나간다.
+
+        lease=True이고 값이 있어도, 만료가 가까워 XFetch가 "지금 갱신하라"고 추첨한 요청 하나에는
+        값과 함께 lease 토큰을 준다 (Item.lease). 그 클라이언트는 만료 전에 원본을 불러 토큰으로 PUT한다.
+        다른 요청은 기다림 없이 평범한 히트를 받는다.
         """
         validate_key(key)
         entry = self._get_live(key)
         if entry is not None:
-            return Item(entry.value, entry.expire_at_ms)
+            token = self._early_refresh_lease(key, entry) if lease else None
+            return Item(entry.value, entry.expire_at_ms, token)
         message = f"키 '{key}'가 없습니다"
         if not lease:
             raise KeyNotFound(message)
@@ -274,7 +310,7 @@ class Store:
             return True
         old_expire_at_ms = entry.expire_at_ms
         new_expire_at_ms = self._now_ms() + ttl * 1000
-        self._table.put(key, entry.value, new_expire_at_ms)
+        self._table.put(key, entry.value, new_expire_at_ms, entry.delta_ms)  # 값은 그대로라 delta도 유지
         self._schedule_expiry(key, old_expire_at_ms, new_expire_at_ms)
         return True
 

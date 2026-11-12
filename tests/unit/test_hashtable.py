@@ -134,3 +134,24 @@ def test_items_delete_during_iteration_is_safe():
     for e in t.items():
         t.delete(e.key)
     assert t.size == 0
+
+
+def test_put_delta_ms_stored_and_default_none():
+    t = HashTable()
+    t.put("a", "1")
+    t.put("b", "2", delta_ms=150)
+    assert (t.get("a").delta_ms, t.get("b").delta_ms) == (None, 150)
+
+
+def test_put_overwrite_replaces_delta_ms():
+    t = HashTable()
+    t.put("a", "1", delta_ms=150)
+    t.put("a", "2")
+    assert t.get("a").delta_ms is None
+
+
+def test_resize_keeps_delta_ms():
+    t = HashTable()
+    for i in range(200):
+        t.put(f"k{i}", i, delta_ms=i)
+    assert all(t.get(f"k{i}").delta_ms == i for i in range(200))

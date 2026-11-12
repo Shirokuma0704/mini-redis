@@ -35,6 +35,11 @@ class LeaseTable:
         self._table.put(key, token, now_ms + LEASE_TTL_MS)
         return token, None
 
+    def issued_at(self, key: str, now_ms: int):
+        """살아 있는 lease의 발급 시각(ms), 없으면 None. XFetch가 재계산 시간(delta)을 재는 데 쓴다."""
+        entry = self._live(key, now_ms)
+        return None if entry is None else entry.expire_at_ms - LEASE_TTL_MS
+
     def consume(self, key: str, token: str, now_ms: int) -> bool:
         """token이 살아 있는 lease와 같으면 lease를 지우고 True. 없거나 만료됐거나 다르면 False."""
         entry = self._live(key, now_ms)

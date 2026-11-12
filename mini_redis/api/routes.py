@@ -87,10 +87,13 @@ def set_key(key: str, request: Request, body: dict = Depends(json_body), store: 
 
 @router.get("/keys/{key}")
 def get_key(key: str, request: Request, lease: bool = Query(False), store: Store = Depends(get_store)):
-    """?lease=1이면 miss의 404에 lease 토큰이나 retry_after_ms가 붙는다 (Store.get)."""
+    """?lease=1이면 miss의 404에 lease 토큰이나 retry_after_ms가 붙고, 만료 직전 히트 하나에는 조기 갱신용 lease가 붙는다 (Store.get)."""
     _reject_unsupported(request)
     item = store.get(decode_key(key), lease=lease)
-    return {"value": item.value, "ttl": _remaining_seconds(store, item.expire_at_ms)}
+    body = {"value": item.value, "ttl": _remaining_seconds(store, item.expire_at_ms)}
+    if item.lease is not None:
+        body["lease"] = item.lease  # 값은 유효하지만 만료가 가까워 이 요청이 미리 갱신을 맡았다 (XFetch)
+    return body
 
 
 @router.delete("/keys/{key}")
