@@ -5,6 +5,10 @@
 """
 
 import json
+import os
+import threading
+
+from mini_redis import config
 
 
 def set_record(key, value, expire_at_ms=None):
@@ -72,3 +76,61 @@ def decode_line(line):
         if field not in record or not is_valid(record[field]):
             raise ValueError(f"{op} 레코드의 {field} 필드가 없거나 타입이 틀려요")
     return record
+
+
+class AofWriter:
+    """AOF 줄을 메모리 버퍼에 모아 두었다가 파일에 적어요.
+
+    append는 버퍼에 줄을 더하기만 해서 가벼워요. 디스크 I/O는 flush()에서만 일어나고,
+    start()로 켠 스레드가 interval_s마다 flush()를 불러요.
+    """
+
+    def __init__(self, path, interval_s=config.AOF_FSYNC_INTERVAL_S):
+        self.path = path
+        self._interval_s = interval_s
+        self._buffer = []
+        self._buffer_lock = threading.Lock()  # 버퍼를 바꿔 끼울 때만 잡아요.
+        self._write_lock = threading.Lock()  # flush끼리 순서가 섞이지 않게 해요.
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def append(self, record):
+        """레코드를 한 줄로 바꿔 버퍼에 더해요. 파일은 건드리지 않아요."""
+        line = encode_record(record)
+        with self._buffer_lock:
+            self._buffer.append(line)
+
+    def flush(self):
+        """버퍼를 파일에 적고 fsync해요. 적은 줄 수를 돌려줘요."""
+        with self._write_lock:
+            # 바꿔 끼우는 것도 쓰기 락 안에서 해야 나중 줄이 먼저 적히지 않아요.
+            with self._buffer_lock:
+                lines, self._buffer = self._buffer, []
+            if not lines:
+                return 0
+            data = "".join(lines).encode("utf-8")
+            with open(self.path, "ab") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            return len(lines)
+
+    def start(self):
+        """1초마다 flush하는 데몬 스레드를 켜요. 이미 켜져 있으면 아무것도 안 해요."""
+        if self._thread is not None:
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """스레드를 멈추고 남은 줄을 마지막으로 flush해요. start 없이 불러도 돼요."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+        self.flush()
+
+    def _run(self):
+        while not self._stop_event.wait(self._interval_s):
+            self.flush()
