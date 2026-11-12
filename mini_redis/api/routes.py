@@ -8,12 +8,7 @@ from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, Query, Request
 
-from ..errors import (
-    InvalidBody,
-    InvalidKey,
-    InvalidTtl,
-    NotImplementedYet,
-)
+from ..errors import InvalidBody, InvalidKey, InvalidTtl
 from ..store import Store
 
 router = APIRouter()
@@ -59,13 +54,6 @@ def _parse_ttl(value) -> int:
     return value
 
 
-def _reject_unsupported(request: Request) -> None:
-    """네임스페이스(#11)가 구현되기 전까지는 조용히 무시하지 않고 거절한다."""
-    q = request.query_params
-    if "ns" in q or "v" in q:
-        raise NotImplementedYet("네임스페이스(ns, v)는 아직 지원하지 않습니다")
-
-
 @router.get("/health")
 def health():
     return {"status": "ok"}
@@ -74,52 +62,68 @@ def health():
 # --- 키 하나 ---
 
 @router.put("/keys/{key}")
-def set_key(key: str, request: Request, body: dict = Depends(json_body), store: Store = Depends(get_store)):
-    _reject_unsupported(request)
+def set_key(
+    key: str,
+    ns: str | None = Query(None),
+    v: int | None = Query(None),
+    body: dict = Depends(json_body),
+    store: Store = Depends(get_store),
+):
+    """ns를 붙이면 ttl과 함께 lease나 v(GET에서 받은 version)가 필요하다 (Store.set)."""
     key = decode_key(key)
     value = body.get("value")
     expire_at_ms = None
     if body.get("ttl") is not None:
         expire_at_ms = store.now_ms() + _parse_ttl(body["ttl"]) * 1000
-    store.set(key, value, expire_at_ms, lease=body.get("lease"))
+    store.set(key, value, expire_at_ms, lease=body.get("lease"), ns=ns, v=v)
     return {"ok": True}
 
 
 @router.get("/keys/{key}")
-def get_key(key: str, request: Request, lease: bool = Query(False), store: Store = Depends(get_store)):
-    """?lease=1이면 miss의 404에 lease 토큰이나 retry_after_ms가 붙고, 만료 직전 히트 하나에는 조기 갱신용 lease가 붙는다 (Store.get)."""
-    _reject_unsupported(request)
-    item = store.get(decode_key(key), lease=lease)
+def get_key(
+    key: str,
+    lease: bool = Query(False),
+    ns: str | None = Query(None),
+    store: Store = Depends(get_store),
+):
+    """?lease=1이면 miss의 404에 lease 토큰이나 retry_after_ms가 붙고, 만료 직전 히트 하나에는 조기 갱신용 lease가 붙는다.
+
+    키 명령에 ?ns=를 붙이면 Store가 `ns:v{버전}:key`로 바꿔 처리한다 (쿼리 값은 서버가 이미 디코딩했다).
+    GET은 200과 404 모두에 현재 버전 `version`이 붙는다 (Store.get).
+    """
+    item = store.get(decode_key(key), lease=lease, ns=ns)
     body = {"value": item.value, "ttl": _remaining_seconds(store, item.expire_at_ms)}
+    if item.version is not None:
+        body["version"] = item.version
     if item.lease is not None:
         body["lease"] = item.lease  # 값은 유효하지만 만료가 가까워 이 요청이 미리 갱신을 맡았다 (XFetch)
     return body
 
 
 @router.delete("/keys/{key}")
-def delete_key(key: str, store: Store = Depends(get_store)):
-    return {"deleted": store.delete(decode_key(key))}
+def delete_key(key: str, ns: str | None = Query(None), store: Store = Depends(get_store)):
+    return {"deleted": store.delete(decode_key(key), ns=ns)}
 
 
 @router.get("/keys/{key}/exists")
-def exists_key(key: str, store: Store = Depends(get_store)):
-    return {"exists": store.exists(decode_key(key))}
+def exists_key(key: str, ns: str | None = Query(None), store: Store = Depends(get_store)):
+    return {"exists": store.exists(decode_key(key), ns=ns)}
 
 
 @router.post("/keys/{key}/incr")
-def incr_key(key: str, body: dict = Depends(json_body), store: Store = Depends(get_store)):
-    return {"value": store.incr(decode_key(key), body.get("amount", 1))}
+def incr_key(key: str, ns: str | None = Query(None), body: dict = Depends(json_body), store: Store = Depends(get_store)):
+    return {"value": store.incr(decode_key(key), body.get("amount", 1), ns=ns)}
 
 
 @router.post("/keys/{key}/expire")
-def expire_key(key: str, body: dict = Depends(json_body), store: Store = Depends(get_store)):
+def expire_key(key: str, ns: str | None = Query(None), body: dict = Depends(json_body), store: Store = Depends(get_store)):
     # 0 이하는 즉시 삭제라 _parse_ttl을 쓰지 않는다. 정수 검사(ttl 없음 포함)는 Store가 INVALID_TTL로 한다
-    return {"updated": store.expire(decode_key(key), body.get("ttl"))}
+    return {"updated": store.expire(decode_key(key), body.get("ttl"), ns=ns)}
 
 
 @router.get("/keys/{key}/ttl")
-def ttl_key(key: str, store: Store = Depends(get_store)):
-    return {"ttl": store.ttl(decode_key(key))}
+def ttl_key(key: str, ns: str | None = Query(None), store: Store = Depends(get_store)):
+    return {"ttl": store.ttl(decode_key(key), ns=ns)}
 
 
 # --- 키 묶음 ---
@@ -132,6 +136,11 @@ def list_keys(prefix: str = Query(""), store: Store = Depends(get_store)):
 @router.delete("/keys")
 def delete_keys(prefix: str = Query(""), store: Store = Depends(get_store)):
     return {"deleted": store.delete_prefix(prefix)}
+
+
+@router.post("/namespaces/{ns}/invalidate")
+def invalidate_namespace(ns: str, store: Store = Depends(get_store)):
+    return {"version": store.invalidate(decode_key(ns))}
 
 
 @router.post("/admin/flush")
