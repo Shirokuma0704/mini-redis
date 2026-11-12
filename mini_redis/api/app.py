@@ -9,6 +9,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..errors import MiniRedisError
 from ..store import Store
+from ..persistence.manager import Persistence
 from .routes import router
 
 log = logging.getLogger(__name__)
@@ -40,16 +41,21 @@ def _error(status: int, code: str, message: str, **extra) -> JSONResponse:
     return JSONResponse(status_code=status, content={"error": code, "message": message, **extra})
 
 
-def create_app(store: Store | None = None) -> FastAPI:
+def create_app(store: Store | None = None, persistence: Persistence | None = None) -> FastAPI:
     store = store or Store()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # 복구가 끝난 뒤에 만료 스레드를 켜요(spec).
+        if persistence:
+            persistence.start(store)
         store.start_expiry()
         try:
             yield
         finally:
             store.stop_expiry()
+            if persistence:
+                persistence.stop()
 
     app = FastAPI(title="Mini Redis", lifespan=lifespan)
     app.state.store = store
@@ -77,4 +83,4 @@ def create_app(store: Store | None = None) -> FastAPI:
     return app
 
 
-app = create_app()
+app = create_app(persistence=Persistence())

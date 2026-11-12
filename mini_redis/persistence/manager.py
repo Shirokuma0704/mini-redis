@@ -13,6 +13,7 @@ from collections.abc import Callable
 from mini_redis import config
 from mini_redis.persistence.aof import AofWriter
 from mini_redis.persistence.layout import aof_name
+from mini_redis.persistence.recovery import RecoveredState, recover
 from mini_redis.persistence.snapshot import delete_old_aofs, write_snapshot
 from mini_redis.store import Store
 
@@ -115,3 +116,70 @@ class Snapshotter:
                 self.maybe_snapshot()
             except Exception:
                 logger.exception("스냅샷 확인 중 예외가 났어요")
+
+
+class Persistence:
+    """서버를 켤 때 복구하고 AOF/스냅샷 스레드를 켜고, 끌 때 정리해요.
+
+    생성자는 파일을 건드리지 않아요. 디렉터리를 만들고 복구하는 일은 start에서 해요.
+    """
+
+    def __init__(
+        self,
+        data_dir: str | os.PathLike[str] = config.DATA_DIR,
+        *,
+        aof_interval_s: float = config.AOF_FSYNC_INTERVAL_S,
+        snapshot_interval_s: float = config.SNAPSHOT_INTERVAL_S,
+        aof_max_bytes: int = config.SNAPSHOT_AOF_MAX_BYTES,
+        check_interval_s: float = 1.0,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._data_dir = pathlib.Path(data_dir)
+        self._aof_interval_s = aof_interval_s
+        self._snapshot_interval_s = snapshot_interval_s
+        self._aof_max_bytes = aof_max_bytes
+        self._check_interval_s = check_interval_s
+        self._monotonic = monotonic
+        self.aof: AofWriter | None = None
+        self.snapshotter: Snapshotter | None = None
+
+    def start(self, store: Store) -> RecoveredState:
+        """복구한 키를 store에 싣고, 그 뒤에 AOF와 스냅샷 스레드를 켜요.
+
+        복구가 끝나기 전에는 AOF를 붙이지 않아요. 그래야 불러오는 set이 다시 기록되지 않아요.
+        깨진 AOF가 있으면 CorruptAofError가 그대로 올라가고, 서버는 뜨지 않아요.
+        """
+        if store._aof is not None:
+            raise RuntimeError("이미 AOF가 붙어 있는 store에는 start할 수 없어요")
+        os.makedirs(self._data_dir, exist_ok=True)
+        state = recover(self._data_dir, store.now_ms())
+        # store.set은 TTL도 타이밍 휠에 등록해요. 아직 AOF가 없으니 다시 기록되지 않아요.
+        for entry in state.table.items():
+            store.set(entry.key, entry.value, entry.expire_at_ms)
+        # state.versions(네임스페이스 버전)는 Store에 둘 곳이 생기는 #11 전까지 불러오지 않아요.
+        aof = AofWriter(self._data_dir / aof_name(state.next_aof), interval_s=self._aof_interval_s)
+        store.attach_aof(aof)
+        aof.start()
+        self.aof = aof
+        snapshotter = Snapshotter(
+            self._data_dir,
+            store,
+            aof,
+            state.next_aof,
+            interval_s=self._snapshot_interval_s,
+            max_aof_bytes=self._aof_max_bytes,
+            check_interval_s=self._check_interval_s,
+            monotonic=self._monotonic,
+        )
+        snapshotter.start()
+        self.snapshotter = snapshotter
+        return state
+
+    def stop(self) -> None:
+        """스냅샷 스레드를 먼저 멈추고, AOF의 남은 줄을 flush해요. start 없이, 두 번 불러도 돼요."""
+        try:
+            if self.snapshotter is not None:
+                self.snapshotter.stop()
+        finally:
+            if self.aof is not None:
+                self.aof.stop()
