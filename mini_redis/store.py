@@ -30,7 +30,7 @@ from .errors import (
 from .hashtable import HashTable
 from .lease import LeaseTable
 from .namespace import VersionTable
-from .persistence.aof import del_record, expire_record, flush_record, set_record
+from .persistence.aof import del_record, expire_record, flush_record, ns_version_record, set_record
 from .timing_wheel import TimingWheel, start_expiry_thread
 from .xfetch import should_refresh_early
 
@@ -128,7 +128,7 @@ class Store:
         self._table = HashTable()
         self._wheel = TimingWheel(self._clock())
         self._leases = LeaseTable()
-        self._versions = VersionTable()  # FLUSH에도 유지한다
+        self._versions = VersionTable(on_change=lambda ns, v: self._log(ns_version_record(ns, v)))  # FLUSH에도 유지한다
         self._expiry_stop = None  # 만료 스레드를 멈추는 Event
         self._aof = aof
 

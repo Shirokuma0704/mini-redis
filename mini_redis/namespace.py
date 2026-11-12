@@ -7,15 +7,18 @@ from .hashtable import HashTable
 
 
 class VersionTable:
-    def __init__(self):
+    def __init__(self, on_change=None):
         self._table = HashTable()
+        self._on_change = on_change  # on_change(ns, version): 버전이 바뀌기 직전에 부른다
 
     def current(self, ns: str, now_ms: int) -> int:
         """ns의 현재 버전. 처음 보는 ns면 지금 시각(ms)을 초기 버전으로 기록한다."""
         entry = self._table.get(ns)
         if entry is not None:
             return entry.value
-        self._table.put(ns, now_ms)  # AOF(#12): nsver로 기록
+        if self._on_change is not None:
+            self._on_change(ns, now_ms)  # 훅을 먼저 불러서, AOF 기록이 실패하면 버전이 그대로 남는다
+        self._table.put(ns, now_ms)
         return now_ms
 
     def invalidate(self, ns: str, now_ms: int) -> int:
@@ -25,5 +28,7 @@ class VersionTable:
         now_ms는 재시작 뒤 버전 테이블을 잃어도 새 버전이 옛 버전보다 크게 한다.
         """
         version = max(self.current(ns, now_ms) + 1, now_ms)
-        self._table.put(ns, version)  # AOF(#12): nsver로 기록
+        if self._on_change is not None:
+            self._on_change(ns, version)  # 훅을 먼저 불러서, AOF 기록이 실패하면 버전이 그대로 남는다
+        self._table.put(ns, version)
         return version
