@@ -2,6 +2,7 @@
 import importlib
 import os
 
+import pytest
 from fastapi.testclient import TestClient
 
 import mini_redis.api.app as app_module
@@ -90,3 +91,22 @@ def test_create_app_without_persistence_writes_no_files(tmp_path, monkeypatch):
         assert client.put("/keys/a", json={"value": "1"}).status_code == 200
         assert client.get("/keys/a").json()["value"] == "1"
     assert os.listdir(tmp_path) == []
+
+
+def test_lifespan_start_expiry_failure_stops_persistence_and_detaches_aof(tmp_path, monkeypatch):
+    store = Store(clock=FakeClock(T0))
+    persistence = make_persistence(tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("만료 스레드 시작 실패")
+
+    monkeypatch.setattr(store, "start_expiry", boom)
+
+    try:
+        with pytest.raises(RuntimeError):
+            with TestClient(create_app(store, persistence=persistence)):
+                pass
+        assert store._aof is None
+        assert persistence.aof is None
+    finally:
+        persistence.stop()

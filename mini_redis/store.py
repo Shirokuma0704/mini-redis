@@ -234,6 +234,21 @@ class Store:
         return [(e.key, e.value) for e in self._versions._table.items()]
 
     @locked
+    def restore_entries(self, entries) -> None:
+        """복구한 (키, 값, 만료 시각)을 표에 그대로 넣는다.
+
+        `ns:v{버전}:key`처럼 외부 키 한도(256바이트)보다 길 수 있는 내부 키를 복원하려고 있다.
+        그래서 키·값 검증은 하지 않는다. 변경이 아니라 복원이라 AOF에 기록하지 않는다.
+        AOF가 붙은 뒤에는 쓸 수 없다. 복구는 AOF를 붙이기 전에 끝내야 한다.
+        """
+        if self._aof is not None:
+            raise RuntimeError("AOF가 붙은 뒤에는 엔트리를 복원할 수 없어요")
+        for key, value, expire_at_ms in entries:
+            self._check_capacity(key)
+            self._table.put(key, value, expire_at_ms)
+            self._schedule_expiry(key, None, expire_at_ms)
+
+    @locked
     def restore_versions(self, pairs) -> None:
         """복구한 (네임스페이스, 버전)을 표에 그대로 넣는다. 변경이 아니라 복원이라 on_change로 기록하지 않는다.
 

@@ -163,9 +163,9 @@ class Persistence:
             raise RuntimeError("이미 AOF가 붙어 있는 store에는 start할 수 없어요")
         os.makedirs(self._data_dir, exist_ok=True)
         state = recover(self._data_dir, store.now_ms())
-        # store.set은 TTL도 타이밍 휠에 등록해요. 아직 AOF가 없으니 다시 기록되지 않아요.
-        for entry in state.table.items():
-            store.set(entry.key, entry.value, entry.expire_at_ms)
+        # restore_entries는 TTL도 타이밍 휠에 등록하고, 외부 키 한도 검증은 건너뛰어요(ns:v..:key는 더 길 수 있어요).
+        # 아직 AOF가 없으니 다시 기록되지 않아요.
+        store.restore_entries((e.key, e.value, e.expire_at_ms) for e in state.table.items())
         # 버전 표도 AOF를 붙이기 전에 복원해요. 복원은 변경이 아니라서 다시 기록되지 않아요.
         store.restore_versions((e.key, e.value) for e in state.versions.items())
         aof = AofWriter(self._data_dir / aof_name(state.next_aof), interval_s=self._aof_interval_s)
@@ -211,4 +211,9 @@ class Persistence:
                 self.snapshotter.stop()
         finally:
             if self.aof is not None:
-                self.aof.stop()
+                try:
+                    self.aof.stop()
+                finally:
+                    # 멈춘 뒤에는 참조를 비워요. 다시 stop해도 안전하고, 멈춘 writer를 들고 있지 않아요.
+                    self.aof = None
+                    self.snapshotter = None
