@@ -148,6 +148,14 @@ def test_set_after_delete_while_key_missing_raises_lease_invalid(store, invalida
     assert "lease" in miss(store)  # 다음 요청은 새 lease를 받는다
 
 
+def test_set_after_delete_prefix_shorter_than_key_raises_lease_invalid(store):
+    token = issue(store, "user:1")
+    store.delete_prefix("user:")  # 위 [prefix] 경우는 prefix가 키 "k"와 같아서 무효화를 "키 == prefix"로 짜도 통과한다
+    with pytest.raises(LeaseInvalid):
+        store.set("user:1", "stale", lease=token)
+    assert not store.exists("user:1")
+
+
 def test_delete_prefix_other_prefix_keeps_lease(store):
     token = issue(store, "user:1")
     assert store.delete_prefix("post:") == 0
