@@ -111,6 +111,10 @@ class AofWriter:
         # flush가 연속으로 실패하기 시작한 시각(단조 시계)이에요. 오류 없이 flush가 끝나면 None으로 돌아가요.
         self.failing_since: float | None = None
         self._buffer: list[bytes] = []
+        # rotate 전에 쌓였지만 아직 옛 파일에 못 적은 묶음이에요. 오래된 것부터 들어 있어요.
+        self._pending: list[tuple[str | os.PathLike[str], list[bytes]]] = []
+        # 지금 path에 fsync까지 끝난 바이트 수예요. 스냅샷 크기 기준이 이걸 읽고, 파일을 stat하지 않아요.
+        self.current_bytes: int = 0
         self._buffer_lock = threading.Lock()  # 버퍼를 바꿔 끼울 때만 잡아요.
         self._write_lock = threading.RLock()  # flush끼리 순서가 섞이지 않게 해요.
         self._stop_event = threading.Event()
@@ -142,9 +146,74 @@ class AofWriter:
         with self._buffer_lock:
             self._buffer.append(line)
 
+    def rotate(self, new_path: str | os.PathLike[str]) -> None:
+        """이후 줄이 new_path로 가도록 바꿔요. 파일은 열지도 stat하지도 않고 버퍼만 만져요.
+
+        스냅샷은 Store 락 안에서 AOF를 바꿔 끼워야 하는데, 락 안에서는 디스크 I/O를 못 해요.
+        그래서 지금까지 쌓인 줄은 옛 경로 이름표를 붙여 _pending에 넘겨 두고, 실제 쓰기는 flush가 해요.
+        _write_lock은 잡지 않아요. flush가 디스크에 쓰는 동안 락 안의 rotate가 기다리면 안 돼서예요.
+        """
+        if self.broken:
+            raise AofBrokenError("AOF 파일이 깨진 상태라 더 적을 수 없어요")
+        with self._buffer_lock:
+            if self._buffer:
+                self._pending.append((self.path, self._buffer))
+            self._buffer = []
+            self.path = new_path
+            self.current_bytes = 0
+
+    def drop_pending(self) -> int:
+        """옛 파일로 가려고 기다리던 줄을 버리고 몇 줄이었는지 돌려줘요.
+
+        스냅샷 교체가 끝난 뒤에 불러요. 그 줄들의 결과는 이미 새 스냅샷 안에 들어 있어서예요.
+        """
+        with self._buffer_lock:
+            dropped = sum(len(lines) for _, lines in self._pending)
+            self._pending = []
+        return dropped
+
+    def _write_batch(self, path: str | os.PathLike[str], data: bytes) -> tuple[BaseException | None, bool]:
+        """한 파일에 data를 적고 fsync해요. (처음 에러 또는 None, durable 여부)를 돌려줘요."""
+        # with 문을 쓰면 닫기 에러가 처음 에러를 덮어써서, 닫기를 직접 부르고 에러를 따로 모아요.
+        first_error: BaseException | None = None
+        durable = False  # write, flush, fsync가 모두 성공했는지예요.
+        f = None
+        try:
+            try:
+                f = open(path, "ab")
+                start_size = f.tell()  # 이번 시도 전 파일 크기예요.
+                try:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                except Exception:
+                    # 반쯤 쓴 바이트가 남지 않게 원래 크기로 잘라 내요.
+                    try:
+                        f.truncate(start_size)
+                    except Exception as truncate_error:
+                        # 잘라 내지 못하면 다시 써도 안전하지 않아서 깨진 상태로 표시해요.
+                        # 처음 에러가 더 중요해서 그대로 던지고, 이 에러는 따로 남겨 둬요.
+                        self.rollback_error = truncate_error
+                        self.broken = True
+                    raise
+                durable = True
+            except Exception as error:
+                first_error = error
+        finally:
+            # KeyboardInterrupt 같은 예외가 지나가는 중에도 파일은 꼭 닫아요.
+            if f is not None:
+                try:
+                    f.close()
+                except Exception as close_error:
+                    # 이미 실패한 뒤의 닫기 에러는 삼켜서 처음 에러가 이기게 해요.
+                    if first_error is None:
+                        first_error = close_error
+        return first_error, durable
+
     def flush(self) -> int:
         """버퍼를 파일에 적고 fsync해요. 적은 줄 수를 돌려줘요.
 
+        rotate 때문에 옛 파일로 가야 할 묶음이 있으면 오래된 것부터 차례로 적어요.
         실패하면 failing_since에 첫 실패 시각을 남기고, 오류 없이 끝나면 지워요.
         """
         with self._write_lock:
@@ -165,55 +234,46 @@ class AofWriter:
                 raise AofBrokenError("AOF 파일이 깨진 상태라 더 적을 수 없어요")
             # 바꿔 끼우는 것도 쓰기 락 안에서 해야 나중 줄이 먼저 적히지 않아요.
             with self._buffer_lock:
-                lines, self._buffer = self._buffer, []
-            if not lines:
-                return 0
-            data = b"".join(lines)
-            # with 문을 쓰면 닫기 에러가 처음 에러를 덮어써서, 닫기를 직접 부르고 에러를 따로 모아요.
-            first_error: BaseException | None = None
-            durable = False  # write, flush, fsync가 모두 성공했는지예요.
-            f = None
-            try:
-                try:
-                    f = open(self.path, "ab")
-                    start_size = f.tell()  # 이번 시도 전 파일 크기예요.
-                    try:
-                        f.write(data)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    except Exception:
-                        # 반쯤 쓴 바이트가 남지 않게 원래 크기로 잘라 내요.
-                        try:
-                            f.truncate(start_size)
-                        except Exception as truncate_error:
-                            # 잘라 내지 못하면 다시 써도 안전하지 않아서 깨진 상태로 표시해요.
-                            # 처음 에러가 더 중요해서 그대로 던지고, 이 에러는 따로 남겨 둬요.
-                            self.rollback_error = truncate_error
-                            self.broken = True
-                        raise
-                    durable = True
-                except Exception as error:
-                    first_error = error
-            finally:
-                # KeyboardInterrupt 같은 예외가 지나가는 중에도 파일은 꼭 닫아요.
-                if f is not None:
-                    try:
-                        f.close()
-                    except Exception as close_error:
-                        # 이미 실패한 뒤의 닫기 에러는 삼켜서 처음 에러가 이기게 해요.
-                        if first_error is None:
-                            first_error = close_error
-            if first_error is not None:
-                if not durable:
-                    # 들고 나간 줄을 버퍼 맨 앞에 되돌려서 다음 flush가 먼저 적게 해요.
+                batches = [(p, lines) for p, lines in self._pending + [(self.path, self._buffer)] if lines]
+                self._pending = []
+                self._buffer = []
+                current = os.fspath(self.path)
+            # 각 묶음의 경로는 여기서 정해요. 적는 동안 rotate가 와도 self.path를 다시 읽지 않아요.
+            total = 0
+            for index, (path, lines) in enumerate(batches):
+                data = b"".join(lines)
+                first_error, durable = self._write_batch(path, data)
+                if durable and os.fspath(path) == current:
                     with self._buffer_lock:
-                        self._buffer = lines + self._buffer
-                # durable이면 닫기만 실패한 거예요. 줄은 이미 fsync로 디스크에 있어서 되돌리지 않아요.
-                # 다시 적으면 앞부분만 적히다 끊겼을 때 새 값 뒤에 옛 값이 남을 수 있어요.
+                        # 그 사이 rotate가 왔다면 이 바이트는 이미 옛 파일 몫이라 세지 않아요.
+                        if os.fspath(self.path) == current:
+                            self.current_bytes += len(data)
+                if first_error is None:
+                    total += len(lines)
+                    continue
+                # 실패한 묶음과 아직 안 적은 묶음을 되돌려요. 단, durable이면 닫기만 실패한 거라 그 묶음은 빼요.
+                # 줄은 이미 fsync로 디스크에 있어서, 다시 적으면 앞부분만 적히다 끊겼을 때
+                # 새 값 뒤에 옛 값이 남을 수 있어요.
+                requeue = ([] if durable else [(path, lines)]) + batches[index + 1 :]
+                self._requeue(requeue)
                 self.last_error = first_error
                 raise first_error
             self.last_error = None
-            return len(lines)
+            return total
+
+    def _requeue(self, batches: list[tuple[str | os.PathLike[str], list[bytes]]]) -> None:
+        """못 적은 묶음을 제자리로 되돌려요. 그동안 쌓인 줄보다 항상 앞에 놓여요."""
+        with self._buffer_lock:
+            current = os.fspath(self.path)
+            front_buffer: list[bytes] = []
+            front_pending: list[tuple[str | os.PathLike[str], list[bytes]]] = []
+            for path, lines in batches:
+                if os.fspath(path) == current:
+                    front_buffer.extend(lines)
+                else:
+                    front_pending.append((path, lines))
+            self._buffer = front_buffer + self._buffer
+            self._pending = front_pending + self._pending
 
     def start(self) -> None:
         """1초마다 flush하는 데몬 스레드를 켜요. 이미 켜져 있으면 아무것도 안 해요."""

@@ -233,6 +233,24 @@ class Store:
         return self._now_ms()
 
     @locked
+    def copy_for_snapshot(self, during_lock=None) -> list[tuple[str, str, int | None]]:
+        """만료되지 않은 엔트리를 (키, 값, 만료 시각) 목록으로 복사한다.
+
+        상태를 바꾸지 않는다: 만료된 키는 건너뛸 뿐 지우지도 AOF에 적지도 않는다.
+        during_lock이 있으면 복사 직후 락을 잡은 채로 부른다. 스냅샷이 여기서 AOF 파일을 바꿔 끼우면
+        복사본과 새 AOF의 경계가 정확히 맞는다.
+        """
+        now = self._now_ms()
+        entries = [
+            (entry.key, entry.value, entry.expire_at_ms)
+            for entry in self._table.items()
+            if entry.expire_at_ms is None or now < entry.expire_at_ms
+        ]
+        if during_lock is not None:
+            during_lock()
+        return entries
+
+    @locked
     def size(self) -> int:
         """저장된 엔트리 수 (만료됐지만 아직 회수되지 않은 키 포함)."""
         return self._table.size
