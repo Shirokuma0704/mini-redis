@@ -8,11 +8,12 @@ import os
 import pathlib
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from mini_redis import config
 from mini_redis.persistence.aof import AofWriter
 from mini_redis.persistence.layout import aof_name
+from mini_redis.persistence.recovery import RecoveredState, recover
 from mini_redis.persistence.snapshot import delete_old_aofs, write_snapshot
 from mini_redis.store import Store
 
@@ -36,9 +37,11 @@ class Snapshotter:
         max_aof_bytes: int = config.SNAPSHOT_AOF_MAX_BYTES,
         check_interval_s: float = 1.0,
         monotonic: Callable[[], float] = time.monotonic,
+        versions_source: Callable[[], Iterable[tuple[str, int]]] | None = None,
     ) -> None:
         self._data_dir = pathlib.Path(data_dir)
         self._store = store
+        self._versions_source = versions_source  # (네임스페이스, 버전) 목록을 돌려줘요. None이면 버전 없이 찍어요.
         self._aof = aof
         self.aof_number = aof_number
         self._interval_s = interval_s
@@ -59,8 +62,16 @@ class Snapshotter:
         next_number = self.aof_number + 1
         new_path = self._data_dir / aof_name(next_number)
         # 1. 락 안에서 복사와 AOF 전환을 한꺼번에 해요. 전환은 버퍼만 만져서 디스크 I/O가 없어요.
+        versions: list[tuple[str, int]] = []
+
+        def during_lock() -> None:
+            # 엔트리 복사, AOF 전환, 버전 읽기가 모두 같은 Store 락 안에서 일어나요.
+            self._aof.rotate(new_path)
+            if self._versions_source is not None:
+                versions[:] = list(self._versions_source())
+
         try:
-            entries = self._store.copy_for_snapshot(during_lock=lambda: self._aof.rotate(new_path))
+            entries = self._store.copy_for_snapshot(during_lock=during_lock)
         except Exception:
             logger.exception("스냅샷 복사 또는 AOF 전환에 실패했어요")
             return False
@@ -73,7 +84,7 @@ class Snapshotter:
             logger.exception("옛 AOF 파일에 마지막 줄을 적지 못했어요")
         # 3. 스냅샷을 쓰고 교체해요. 실패하면 옛 스냅샷과 AOF 파일이 그대로라 복구는 여전히 맞아요.
         try:
-            write_snapshot(self._data_dir, entries, [], next_aof=next_number)
+            write_snapshot(self._data_dir, entries, versions, next_aof=next_number)
         except Exception:
             logger.exception("스냅샷 파일 쓰기에 실패했어요")
             return False
@@ -115,3 +126,94 @@ class Snapshotter:
                 self.maybe_snapshot()
             except Exception:
                 logger.exception("스냅샷 확인 중 예외가 났어요")
+
+
+class Persistence:
+    """서버를 켤 때 복구하고 AOF/스냅샷 스레드를 켜고, 끌 때 정리해요.
+
+    생성자는 파일을 건드리지 않아요. 디렉터리를 만들고 복구하는 일은 start에서 해요.
+    """
+
+    def __init__(
+        self,
+        data_dir: str | os.PathLike[str] = config.DATA_DIR,
+        *,
+        aof_interval_s: float = config.AOF_FSYNC_INTERVAL_S,
+        snapshot_interval_s: float = config.SNAPSHOT_INTERVAL_S,
+        aof_max_bytes: int = config.SNAPSHOT_AOF_MAX_BYTES,
+        check_interval_s: float = 1.0,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._data_dir = pathlib.Path(data_dir)
+        self._aof_interval_s = aof_interval_s
+        self._snapshot_interval_s = snapshot_interval_s
+        self._aof_max_bytes = aof_max_bytes
+        self._check_interval_s = check_interval_s
+        self._monotonic = monotonic
+        self.aof: AofWriter | None = None
+        self.snapshotter: Snapshotter | None = None
+
+    def start(self, store: Store) -> RecoveredState:
+        """복구한 키를 store에 싣고, 그 뒤에 AOF와 스냅샷 스레드를 켜요.
+
+        복구가 끝나기 전에는 AOF를 붙이지 않아요. 그래야 불러오는 set이 다시 기록되지 않아요.
+        깨진 AOF가 있으면 CorruptAofError가 그대로 올라가고, 서버는 뜨지 않아요.
+        """
+        if store._aof is not None:
+            raise RuntimeError("이미 AOF가 붙어 있는 store에는 start할 수 없어요")
+        os.makedirs(self._data_dir, exist_ok=True)
+        state = recover(self._data_dir, store.now_ms())
+        # restore_entries는 TTL도 타이밍 휠에 등록하고, 외부 키 한도 검증은 건너뛰어요(ns:v..:key는 더 길 수 있어요).
+        # 아직 AOF가 없으니 다시 기록되지 않아요.
+        store.restore_entries((e.key, e.value, e.expire_at_ms) for e in state.table.items())
+        # 버전 표도 AOF를 붙이기 전에 복원해요. 복원은 변경이 아니라서 다시 기록되지 않아요.
+        store.restore_versions((e.key, e.value) for e in state.versions.items())
+        aof = AofWriter(self._data_dir / aof_name(state.next_aof), interval_s=self._aof_interval_s)
+        store.attach_aof(aof)
+        snapshotter: Snapshotter | None = None
+        try:
+            aof.start()
+            self.aof = aof
+            snapshotter = Snapshotter(
+                self._data_dir,
+                store,
+                aof,
+                state.next_aof,
+                interval_s=self._snapshot_interval_s,
+                max_aof_bytes=self._aof_max_bytes,
+                check_interval_s=self._check_interval_s,
+                monotonic=self._monotonic,
+                versions_source=store.version_items,
+            )
+            snapshotter.start()
+            self.snapshotter = snapshotter
+        except BaseException:
+            # 중간에 실패하면 켠 것을 되돌려요. 정리 중 난 예외가 원래 예외를 가리지 않게 해요.
+            if snapshotter is not None:
+                try:
+                    snapshotter.stop()
+                except Exception:
+                    logger.exception("시작 실패를 되돌리다 스냅샷 스레드를 멈추지 못했어요")
+            try:
+                aof.stop()
+            except Exception:
+                logger.exception("시작 실패를 되돌리다 AOF를 멈추지 못했어요")
+            store.attach_aof(None)
+            self.aof = None
+            self.snapshotter = None
+            raise
+        return state
+
+    def stop(self) -> None:
+        """스냅샷 스레드를 먼저 멈추고, AOF의 남은 줄을 flush해요. start 없이, 두 번 불러도 돼요."""
+        try:
+            if self.snapshotter is not None:
+                self.snapshotter.stop()
+        finally:
+            if self.aof is not None:
+                try:
+                    self.aof.stop()
+                finally:
+                    # 멈춘 뒤에는 참조를 비워요. 다시 stop해도 안전하고, 멈춘 writer를 들고 있지 않아요.
+                    self.aof = None
+                    self.snapshotter = None
