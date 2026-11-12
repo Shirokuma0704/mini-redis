@@ -6,6 +6,8 @@ MAX_KEYS = 1_000_000
 
 INITIAL_CAPACITY = 16
 LOAD_FACTOR = 0.75
+# 점진적 리해싱(#24): get/put/delete 한 번마다 옛 배열에서 새 배열로 옮기는 버킷 수(빈 버킷 포함)
+REHASH_BUCKETS_PER_STEP = 4
 
 EXPIRE_TICK_MS = 100
 EXPIRE_MAX_PER_TICK = 1000

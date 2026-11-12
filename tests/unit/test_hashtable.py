@@ -1,3 +1,5 @@
+import random
+
 import pytest
 
 from mini_redis.hashtable import HashTable, fnv1a_64
@@ -155,3 +157,102 @@ def test_resize_keeps_delta_ms():
     for i in range(200):
         t.put(f"k{i}", i, delta_ms=i)
     assert all(t.get(f"k{i}").delta_ms == i for i in range(200))
+
+
+# --- 점진적 리해싱 (#24) ---
+
+
+def fill_mid_rehash(n_old=1024, rehash_buckets=1):
+    """옛 배열 n_old칸에서 리사이즈를 막 시작한 테이블과 넣은 키 목록."""
+    t = HashTable(capacity=n_old, rehash_buckets=rehash_buckets)
+    keys = [f"k{i}" for i in range(n_old * 3 // 4 + 1)]
+    for k in keys:
+        t.put(k, k)
+    assert t._old is not None
+    return t, keys
+
+
+def test_put_crossing_load_factor_moves_only_rehash_buckets():
+    t = HashTable(capacity=16, rehash_buckets=2)
+    for i in range(13):  # 13/16 > 0.75
+        t.put(f"k{i}", i)
+    assert (t.capacity, t._rehash_idx) == (32, 2)  # 새 배열만 만들고 옛 버킷은 2개만 옮겼다
+    for _ in range(6):
+        t.get("nope")
+    assert t._old is not None
+    t.get("nope")  # 남은 14개 / 2 = 7번째 명령에서 끝난다
+    assert t._old is None
+    assert all(t.get(f"k{i}").value == i for i in range(13))
+
+
+def test_rehash_buckets_larger_than_table_resizes_at_once():
+    t = HashTable(capacity=16, rehash_buckets=1 << 62)  # 측정의 일괄 리사이즈 모드
+    for i in range(13):
+        t.put(f"k{i}", i)
+    assert (t.capacity, t._old) == (32, None)
+
+
+def test_hashtable_init_non_positive_rehash_buckets_raises():
+    with pytest.raises(ValueError):
+        HashTable(rehash_buckets=0)
+
+
+
+def test_put_burst_outrunning_rehash_keeps_all_keys():
+    t = HashTable(capacity=16, rehash_buckets=1)  # 버킷 1개씩이면 put만 이어질 때 새 배열이 옮기기 전에 다시 0.75를 넘는다
+    for i in range(5000):
+        t.put(f"k{i}", i)
+    assert t.size == 5000
+    assert all(t.get(f"k{i}").value == i for i in range(5000))
+
+@pytest.mark.parametrize("seed", range(20))
+def test_hashtable_random_ops_during_rehash_match_dict_model(seed):
+    rng = random.Random(seed)
+    weak = lambda k: fnv1a_64(k) & 0x3F  # 해시 64가지: 체인이 길어 체인 중간 삭제·이동이 자주 일어난다
+    t = HashTable(capacity=1, hash_fn=weak if seed % 2 else fnv1a_64, rehash_buckets=1)
+    model = {}
+    checked_items_mid_rehash = 0
+    for step in range(3000):
+        key = f"k{rng.randrange(10 + step // 4)}"  # 키 공간을 넓혀 가며 리사이즈가 계속 일어나게
+        r = rng.random()
+        if r < 0.45:
+            value = rng.random()
+            assert t.put(key, value) is (key not in model)
+            model[key] = value
+        elif r < 0.7:
+            assert t.delete(key) is (model.pop(key, None) is not None)
+        elif r < 0.97:
+            e = t.get(key)
+            assert (e.value if e else None) == model.get(key)
+        else:
+            checked_items_mid_rehash += t._old is not None
+            assert sorted((e.key, e.value) for e in t.items()) == sorted(model.items())
+        assert t.size == len(model)
+    assert checked_items_mid_rehash > 0
+
+
+@pytest.mark.parametrize("pick", [lambda i: True, lambda i: i % 3 == 0])
+def test_items_delete_during_rehash_yields_each_once_and_deletes(pick):
+    t, keys = fill_mid_rehash()
+    for _ in range(300):  # 옛 배열 일부만 옮긴 상태로
+        t.get("nope")
+    seen = []
+    for e in t.items():
+        seen.append(e.key)
+        if pick(int(e.key[1:])):
+            t.delete(e.key)  # prefix 삭제가 만료 키를 지우는 것과 같은 모양
+    assert sorted(seen) == sorted(keys)  # 두 번 나오거나 빠진 키가 없다
+    kept = [k for k in keys if not pick(int(k[1:]))]
+    assert t.size == len(kept)
+    assert sorted(e.key for e in t.items()) == sorted(kept)
+    assert all(t.get(k) is not None for k in kept)
+
+
+def test_items_finished_or_broken_resumes_rehash():
+    t, _ = fill_mid_rehash(n_old=16)
+    for _ in t.items():
+        break  # 중간에 멈춘 순회도 닫히면 리해싱을 다시 허락한다
+    list(t.items())
+    for _ in range(16):
+        t.get("nope")
+    assert t._old is None
