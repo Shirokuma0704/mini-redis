@@ -294,3 +294,19 @@ def test_unexpected_exception_returns_500_in_error_format(client, store, monkeyp
     monkeypatch.setattr(store, "get", lambda key: 1 / 0)
     r = client.get("/keys/a")
     assert (r.status_code, err(r)) == (500, "INTERNAL_ERROR")
+
+
+def test_put_value_with_lone_surrogate_returns_400_and_stores_nothing(client, store):
+    r = client.put(
+        "/keys/a",
+        content='{"value":"x\\ud800y"}',
+        headers={"content-type": "application/json"},
+    )
+    assert (r.status_code, err(r)) == (400, "INVALID_VALUE")
+    assert store.size() == 0
+    assert client.get("/keys/a").status_code == 404  # 읽을 수 없는 키가 남지 않는다
+
+
+def test_put_emoji_value_roundtrips(client):
+    client.put("/keys/e", json={"value": "😀한글"})
+    assert client.get("/keys/e").json()["value"] == "😀한글"

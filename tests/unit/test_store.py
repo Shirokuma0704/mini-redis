@@ -96,3 +96,17 @@ def test_store_public_method_reentrant_lock_does_not_deadlock():
     store = Store()
     with store._lock:
         assert store.size() == 0  # 같은 스레드가 다시 잡아도 교착 없음
+
+
+def test_validate_key_lone_surrogate_raises_invalid_key():
+    with pytest.raises(InvalidKey):
+        validate_key("a\ud800b")
+
+
+def test_validate_value_lone_surrogate_raises_invalid_value():
+    with pytest.raises(InvalidValue):
+        validate_value("x\ud800y")
+
+
+def test_validate_value_valid_emoji_surrogate_pair_allowed():
+    validate_value("😀")  # 정상적인 이모지는 서로게이트 쌍이 아니라 한 글자
