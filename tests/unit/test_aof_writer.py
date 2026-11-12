@@ -595,3 +595,96 @@ def test_flush_되돌리기가_성공한_실패는_broken이_아니고_다음_fl
     assert writer.rollback_error is None
     assert writer.flush() == 2
     assert path.read_bytes() == expected_bytes([a, b])
+
+
+class _EverythingFailsFile:
+    """write·truncate·close가 모두 각자 다른 예외를 내는 가짜 파일이에요. __exit__는 close를 불러요."""
+
+    def __init__(self, write_error, truncate_error, close_error):
+        self._write_error = write_error
+        self._truncate_error = truncate_error
+        self._close_error = close_error
+
+    def tell(self):
+        return 0
+
+    def write(self, *args, **kwargs):
+        raise self._write_error
+
+    def flush(self):
+        return None
+
+    def fileno(self):
+        return 0
+
+    def truncate(self, *args, **kwargs):
+        raise self._truncate_error
+
+    def close(self):
+        raise self._close_error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
+
+
+# 항목 25
+def test_flush_쓰기_되돌리기_닫기가_모두_실패해도_처음_쓰기_예외가_올라오고_들고_나간_줄은_버퍼에_남는다(tmp_path, monkeypatch):
+    # close 예외가 with의 __exit__에서 먼저 터져도 처음 실패(A)가 가려지면 안 돼요.
+    path = tmp_path / "appendonly.aof"
+    writer = AofWriter(path)
+    write_error = OSError("write 실패")
+    truncate_error = OSError("truncate 실패")
+    close_error = OSError("close 실패")
+
+    def fake_open(*args, **kwargs):
+        return _EverythingFailsFile(write_error, truncate_error, close_error)
+
+    monkeypatch.setattr(aof_module, "open", fake_open, raising=False)
+    record = set_record("a", "1", None)
+    writer.append(record)
+    try:
+        writer.flush()
+        raised = None
+    except OSError as e:
+        raised = e
+    assert raised is write_error
+    assert writer.last_error is write_error
+    assert writer.rollback_error is truncate_error
+    assert writer.broken is True
+    assert writer._buffer == [encode_record(record).encode("utf-8")]
+
+
+# 항목 26
+def test_flush_되돌리기까지_실패해도_들고_나간_줄이_append_순서대로_버퍼에_그대로_남는다(tmp_path, monkeypatch):
+    path = tmp_path / "appendonly.aof"
+    writer = AofWriter(path, interval_s=HUGE_INTERVAL_S)
+    # 항목 21의 broken 경로를 만들되, 줄이 둘 이상이어야 순서를 볼 수 있어서 직접 더 넣어요.
+    real_open = builtins.open
+
+    def fake_open(*args, **kwargs):
+        return _TruncateFailsFile(real_open(*args, **kwargs), OSError("truncate 실패"))
+
+    def failing_fsync(fd):
+        raise OSError("fsync 실패")
+
+    monkeypatch.setattr(aof_module, "open", fake_open, raising=False)
+    monkeypatch.setattr(aof_module.os, "fsync", failing_fsync)
+    first = set_record("a", "1", None)
+    second = set_record("b", "2", None)
+    writer.append(first)
+    writer.append(second)
+    try:
+        writer.flush()
+        raised = None
+    except OSError as e:
+        raised = e
+    assert raised is not None
+    assert writer.broken is True
+    assert writer._buffer == [
+        encode_record(first).encode("utf-8"),
+        encode_record(second).encode("utf-8"),
+    ]
