@@ -65,6 +65,27 @@ def summarize(latencies_ms, errors, hits, misses, wall_s):
     }
 
 
+def phase_wall_seconds(started, completions):
+    """단계의 벽시계 시간. 출발 직전 시각부터 워커들의 마지막 요청 완료 시각 중 가장 늦은 것까지다.
+    클라이언트를 닫고 스레드를 join하는 시간은 넣지 않는다."""
+    return max(completions) - started
+
+
+def server_command(target, port):
+    """uvicorn 실행 명령. --workers 1로 서버마다 프로세스를 하나로 고정한다(여러 개면 캐시 hit 집계와 처리량이 달라진다)."""
+    return [
+        sys.executable, "-m", "uvicorn", target,
+        "--port", str(port), "--workers", "1", "--log-level", "warning",
+    ]
+
+
+def server_env(base_env, extra):
+    """자식 프로세스 환경. 환경 변수 WEB_CONCURRENCY가 --workers를 덮어쓰지 못하게 빼고 extra를 얹는다(base_env는 안 바꾼다)."""
+    env = {k: v for k, v in base_env.items() if k != "WEB_CONCURRENCY"}
+    env.update(extra)
+    return env
+
+
 def free_port():
     """0번 포트에 bind해 운영체제가 고른 빈 포트를 읽고 닫는다."""
     with socket.socket() as s:
@@ -128,9 +149,9 @@ def servers(use_cache):
                 log_path = tmp / f"{port}.log"
                 log = open(log_path, "wb")
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "uvicorn", target, "--port", str(port), "--log-level", "warning"],
+                    server_command(target, port),
                     cwd=str(redis_cwd),  # 세 프로세스 모두 임시 폴더에서 시작한다. 코드는 PYTHONPATH로 찾는다.
-                    env={**base_env, **extra},
+                    env=server_env(base_env, extra),
                     stdout=log,
                     stderr=subprocess.STDOUT,
                 )
@@ -162,6 +183,7 @@ def run_phase(sample_url, origin_url, ids, concurrency):
     workers = max(1, min(concurrency, len(ids)))
     barrier = threading.Barrier(workers + 1)
     results = [([], 0, Counter()) for _ in range(workers)]  # 스레드마다 (지연 ms, 에러 수, X-Cache 집계)
+    last_done = [None] * workers  # 스레드마다 마지막 요청이 끝난 perf_counter 시각
 
     def worker(slot):
         latencies, tally, errors = [], Counter(), 0
@@ -180,6 +202,7 @@ def run_phase(sample_url, origin_url, ids, concurrency):
                     except httpx.HTTPError:
                         status = None
                     elapsed_ms = (time.perf_counter_ns() - start) / 1e6
+                    last_done[slot] = time.perf_counter()
                     if status == 200:
                         latencies.append(elapsed_ms)
                         tally[response.headers.get("X-Cache", "-")] += 1
@@ -191,11 +214,12 @@ def run_phase(sample_url, origin_url, ids, concurrency):
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(workers)]
     for t in threads:
         t.start()
+    started = time.perf_counter()  # 배리어를 풀기 직전에 잡는다(풀린 뒤에 잡으면 첫 요청 일부가 빠진다)
     barrier.wait()
-    started = time.perf_counter()
     for t in threads:
         t.join()
-    wall_s = time.perf_counter() - started
+    completions = [t for t in last_done if t is not None] or [started]
+    wall_s = phase_wall_seconds(started, completions)  # 마지막 요청이 끝난 시각까지만, join/정리 시간은 뺀다
 
     latencies = [x for lat, _, _ in results for x in lat]
     errors = sum(e for _, e, _ in results)
@@ -203,7 +227,10 @@ def run_phase(sample_url, origin_url, ids, concurrency):
     stats = httpx.get(f"{sample_url}/stats", timeout=5).json()
     origin_calls = httpx.get(f"{origin_url}/stats", timeout=5).json()["calls"]
     summary = summarize(latencies, errors, stats["hits"], stats["misses"], wall_s)
-    summary.update(wall_s=wall_s, xcache=dict(tally), origin_calls=origin_calls)
+    summary.update(
+        wall_s=wall_s, xcache=dict(tally), origin_calls=origin_calls,
+        started=started, ended=max(completions),
+    )
     return summary
 
 
@@ -219,6 +246,14 @@ def run_mode(use_cache, items, requests, concurrency):
             "cold": run_phase(sample_url, origin_url, cold_ids, concurrency),
             "warm": run_phase(sample_url, origin_url, warm_ids, concurrency),
         }
+
+
+def ttl_interval(result):
+    """캐시 켬 한 번의 TTL 구간: 첫 요청 단계 출발 직전부터 이후 요청 단계의 마지막 완료까지 이어진 하나의 구간이다.
+    그 사이의 리셋, 통계 읽기, 큐와 클라이언트 준비 시간이 모두 들어 있다. (시작, 끝, 길이) 초를 돌려준다."""
+    begin = result["cold"]["started"]
+    end = result["warm"]["ended"]
+    return begin, end, end - begin
 
 
 def to_markdown(args, runs, warnings):
@@ -247,6 +282,11 @@ def to_markdown(args, runs, warnings):
                 f"| {label} | {repeat_no} | {r['count']} | {r['errors']} | {r['p50']:.1f} | {r['p95']:.1f} | "
                 f"{r['max']:.1f} | {r['throughput']:.1f} | {r['hit_ratio']:.3f} | {r['origin_calls']} |"
             )
+    lines += ["", "캐시 켬 실행별 만료 점검 구간(첫 요청 출발 직전부터 이후 요청 마지막 완료까지, 시작을 0으로 둔 초):", ""]
+    for label, repeat_no, result in runs:
+        if label == "켬":
+            begin, end, length = ttl_interval(result)
+            lines.append(f"- {label} {repeat_no}회차 TTL 구간: 0.0 ~ {length:.1f}초 (길이 {length:.1f}초)")
     lines += ["", "X-Cache 헤더 집계(단계별):", ""]
     for label, repeat_no, result in runs:
         for key, title in PHASES:
@@ -269,7 +309,7 @@ def main(argv=None):
             result = run_mode(use_cache, args.items, args.requests, args.concurrency)
             runs.append((label, repeat_no, result))
             if use_cache:
-                total_s = result["cold"]["wall_s"] + result["warm"]["wall_s"]
+                total_s = ttl_interval(result)[2]  # 두 단계 사이의 준비 시간까지 포함한 이어진 구간
                 if total_s > config.SAMPLE_CACHE_TTL_S - 5:
                     msg = (
                         f"캐시 켬 {repeat_no}회차가 TTL({config.SAMPLE_CACHE_TTL_S}초)에 가까울 만큼 길어서 "

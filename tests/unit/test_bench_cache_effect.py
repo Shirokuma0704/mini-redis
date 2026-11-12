@@ -4,12 +4,15 @@
 - percentile(values, pct): 최근접 순위(nearest-rank). 정렬 안 된 목록도 받고, 순위 = ceil(pct/100 * n)(최소 1)번째 값. 빈 목록은 ValueError.
 - summarize(latencies_ms, errors, hits, misses, wall_s) -> dict: count, errors, p50, p95, max, throughput, hit_ratio.
   count는 성공한 요청 수(= len(latencies_ms)), throughput = count / wall_s, hit_ratio = hits / (hits + misses)(둘 다 0이면 0.0).
+- server_command(target, port) -> list[str]: uvicorn 실행 명령. "--workers"와 바로 뒤 값 "1"이 들어 있어야 해요(서버마다 프로세스 하나).
+- server_env(base_env, extra) -> dict: 자식 프로세스 환경. base_env에서 WEB_CONCURRENCY를 빼고 extra를 얹어요(base_env는 안 바꿔요).
+- phase_wall_seconds(started, completions) -> float: 단계 벽시계 시간 = max(completions) - started. completions는 워커별 마지막 요청 완료 시각(perf_counter)이에요.
 - main(argv): 결과를 --out 경로에 쓰고, 표는 "첫 요청"과 "이후 요청" 제목 아래 하나씩이에요.
 """
 
 import pytest
 
-from bench.cache_effect import main, percentile, summarize
+from bench.cache_effect import main, percentile, phase_wall_seconds, server_command, server_env, summarize
 
 
 def test_percentile_원소_하나면_어떤_pct든_그_값():
@@ -50,6 +53,36 @@ def test_summarize_합성_목록의_count_에러_hit_ratio():
 def test_summarize_hits와_misses가_모두_0이면_hit_ratio는_0():
     result = summarize([1.0, 2.0], errors=0, hits=0, misses=0, wall_s=1.0)
     assert result["hit_ratio"] == 0.0
+
+
+def test_server_command_workers_1이_들어_있어요():
+    command = server_command("sample_app.app:app", 8123)
+    assert "--workers" in command
+    assert command[command.index("--workers") + 1] == "1"
+
+
+def test_server_command_대상과_포트와_uvicorn이_들어_있어요():
+    command = server_command("sample_app.app:app", 8123)
+    assert "uvicorn" in command
+    assert "sample_app.app:app" in command
+    assert command[command.index("--port") + 1] == "8123"
+
+
+def test_server_env_WEB_CONCURRENCY를_지워요():
+    base = {"PATH": "x", "WEB_CONCURRENCY": "4"}
+    env = server_env(base, {"SAMPLE_USE_CACHE": "1"})
+    assert "WEB_CONCURRENCY" not in env
+    assert env["PATH"] == "x"
+    assert env["SAMPLE_USE_CACHE"] == "1"
+    assert base == {"PATH": "x", "WEB_CONCURRENCY": "4"}  # 원본은 그대로
+
+
+def test_phase_wall_seconds_마지막_완료_시각의_최댓값_빼기_시작():
+    assert phase_wall_seconds(10.0, [11.0, 13.5, 12.0]) == pytest.approx(3.5)
+
+
+def test_phase_wall_seconds_완료_시각이_하나여도_계산해요():
+    assert phase_wall_seconds(2.0, [2.5]) == pytest.approx(0.5)
 
 
 def phase_rows(text, heading):
@@ -99,3 +132,13 @@ def test_cache_effect_전체_실행_두_모드의_행과_hit_ratio_원본_호출
     assert int(cold_by_mode[off][9]) + int(warm_by_mode[off][9]) == 9
     assert int(cold_by_mode[on][9]) + int(warm_by_mode[on][9]) == 3
     assert int(warm_by_mode[on][9]) == 0
+
+
+def test_cache_effect_결과_파일에_캐시_켬_TTL_구간이_기록돼요(tmp_path):
+    out = tmp_path / "cache_effect.md"
+    main(["--items", "3", "--requests", "6", "--concurrency", "2", "--out", str(out)])
+
+    # 구현이 맞출 약속: 캐시 켬 실행마다 "TTL 구간"이 든 줄이 하나씩 있고, 끔 실행에는 없어요.
+    lines = [line for line in out.read_text(encoding="utf-8").splitlines() if "TTL 구간" in line]
+    assert len(lines) == 1
+    assert "켬" in lines[0] and "끔" not in lines[0]
