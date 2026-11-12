@@ -1,12 +1,15 @@
 """AofWriter(메모리 버퍼 + 1초 flush 스레드) 단위 테스트.
 
-time.sleep은 쓰지 않아요. flush()를 직접 부르고, 스레드 테스트는 interval_s를 아주 크게 잡아
-루프가 혼자 돌지 않게 한 뒤 stop()에 기대요.
+time.sleep은 쓰지 않아요. flush()를 직접 부르고, 스레드 테스트는 두 가지로 나뉘어요.
+interval_s를 아주 크게 잡아 루프가 혼자 돌지 않게 한 뒤 stop()에 기대는 테스트와,
+interval_s=0.01로 루프를 실제로 돌려 Event.wait(5)로 flush가 일어난 순간을 기다리는 테스트예요.
 """
 
 import builtins
 import os
 import threading
+
+import pytest
 
 import mini_redis.persistence.aof as aof_module
 from mini_redis.persistence.aof import (
@@ -688,3 +691,99 @@ def test_flush_되돌리기까지_실패해도_들고_나간_줄이_append_순�
         encode_record(first).encode("utf-8"),
         encode_record(second).encode("utf-8"),
     ]
+
+
+class _CloseFailsFile:
+    """write·flush·fileno는 그대로 두고 close만 실패시키는 래퍼예요. 진짜 파일은 먼저 닫아 줘요."""
+
+    def __init__(self, real_file, close_error):
+        self._real = real_file
+        self._close_error = close_error
+
+    def tell(self):
+        return self._real.tell()
+
+    def write(self, *args, **kwargs):
+        return self._real.write(*args, **kwargs)
+
+    def flush(self):
+        return self._real.flush()
+
+    def fileno(self):
+        return self._real.fileno()
+
+    def truncate(self, *args, **kwargs):
+        return self._real.truncate(*args, **kwargs)
+
+    def close(self):
+        self._real.close()  # tmp 정리가 되도록 진짜 파일은 닫고 나서 예외를 내요.
+        raise self._close_error
+
+
+# 항목 27
+def test_flush_쓰기_flush_fsync가_성공하고_닫기만_실패하면_줄은_버퍼로_돌아가지_않고_파일에_한_번만_남는다(tmp_path, monkeypatch):
+    # 이미 fsync된 묶음을 다시 붙이면, 재시도가 중간에 끊겼을 때 새 값 뒤에 옛 값이 남을 수 있어요.
+    path = tmp_path / "appendonly.aof"
+    writer = AofWriter(path)
+    real_open = builtins.open
+    close_error = OSError("close 실패")
+
+    def fake_open(*args, **kwargs):
+        return _CloseFailsFile(real_open(*args, **kwargs), close_error)
+
+    monkeypatch.setattr(aof_module, "open", fake_open, raising=False)
+    old = set_record("k", "old", None)
+    new = set_record("k", "new", None)
+    writer.append(old)
+    writer.append(new)
+    try:
+        writer.flush()
+        raised = None
+    except OSError as e:
+        raised = e
+    assert raised is close_error
+    assert writer.last_error is close_error
+    assert writer.broken is False
+    assert writer.rollback_error is None
+    assert writer._buffer == []
+    assert path.read_bytes() == expected_bytes([old, new])
+    before = path.read_bytes()
+    assert writer.flush() == 0
+    assert path.read_bytes() == before
+
+
+class _WriteInterruptedFile:
+    """write가 KeyboardInterrupt를 내는 가짜 파일이에요. close가 불렸는지 기록해요."""
+
+    def __init__(self):
+        self.close_called = False
+
+    def tell(self):
+        return 0
+
+    def write(self, *args, **kwargs):
+        raise KeyboardInterrupt
+
+    def flush(self):
+        return None
+
+    def fileno(self):
+        return 0
+
+    def truncate(self, *args, **kwargs):
+        return None
+
+    def close(self):
+        self.close_called = True
+
+
+# 항목 28
+def test_flush_쓰기에서_KeyboardInterrupt가_나도_파일은_닫고_예외는_그대로_올라온다(tmp_path, monkeypatch):
+    path = tmp_path / "appendonly.aof"
+    writer = AofWriter(path)
+    fake = _WriteInterruptedFile()
+    monkeypatch.setattr(aof_module, "open", lambda *args, **kwargs: fake, raising=False)
+    writer.append(set_record("a", "1", None))
+    with pytest.raises(KeyboardInterrupt):
+        writer.flush()
+    assert fake.close_called is True

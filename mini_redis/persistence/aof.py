@@ -1,7 +1,7 @@
 """AOF 한 줄 형식: 레코드(dict)를 만들고, 한 줄 JSON으로 바꾸고, 다시 읽어요.
 
 한 줄에 JSON 하나를 적고, 만료 시각은 상대값이 아니라 절대 epoch ms로 적어요.
-파일 쓰기와 복구는 이 모듈의 다른 기능이 맡아요.
+이 모듈은 줄 형식과 AofWriter(버퍼링, 파일 쓰기)를 맡아요. 스냅샷과 복구는 다른 모듈이 맡아요.
 """
 
 import json
@@ -133,40 +133,45 @@ class AofWriter:
             data = b"".join(lines)
             # with 문을 쓰면 닫기 에러가 처음 에러를 덮어써서, 닫기를 직접 부르고 에러를 따로 모아요.
             first_error: BaseException | None = None
+            durable = False  # write, flush, fsync가 모두 성공했는지예요.
             f = None
             try:
-                f = open(self.path, "ab")
-                start_size = f.tell()  # 이번 시도 전 파일 크기예요.
                 try:
-                    f.write(data)
-                    f.flush()
-                    os.fsync(f.fileno())
-                except Exception:
-                    # 반쯤 쓴 바이트가 남지 않게 원래 크기로 잘라 내요.
+                    f = open(self.path, "ab")
+                    start_size = f.tell()  # 이번 시도 전 파일 크기예요.
                     try:
-                        f.truncate(start_size)
-                    except Exception as truncate_error:
-                        # 잘라 내지 못하면 다시 써도 안전하지 않아서 깨진 상태로 표시해요.
-                        # 처음 에러가 더 중요해서 그대로 던지고, 이 에러는 따로 남겨 둬요.
-                        self.rollback_error = truncate_error
-                        self.broken = True
-                    raise
-            except Exception as error:
-                first_error = error
-            if f is not None:
-                try:
-                    f.close()
-                except Exception as close_error:
-                    # 이미 실패한 뒤의 닫기 에러는 삼켜서 처음 에러가 이기게 해요.
-                    # fsync까지 성공한 뒤 닫기만 실패하면 데이터가 이미 디스크에 있을 수 있지만
-                    # 알 수 없어서 실패로 다뤄요. 다시 적어 줄이 겹쳐도 모든 레코드가
-                    # 대입이라 결과가 같아서 괜찮아요.
-                    if first_error is None:
-                        first_error = close_error
+                        f.write(data)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    except Exception:
+                        # 반쯤 쓴 바이트가 남지 않게 원래 크기로 잘라 내요.
+                        try:
+                            f.truncate(start_size)
+                        except Exception as truncate_error:
+                            # 잘라 내지 못하면 다시 써도 안전하지 않아서 깨진 상태로 표시해요.
+                            # 처음 에러가 더 중요해서 그대로 던지고, 이 에러는 따로 남겨 둬요.
+                            self.rollback_error = truncate_error
+                            self.broken = True
+                        raise
+                    durable = True
+                except Exception as error:
+                    first_error = error
+            finally:
+                # KeyboardInterrupt 같은 예외가 지나가는 중에도 파일은 꼭 닫아요.
+                if f is not None:
+                    try:
+                        f.close()
+                    except Exception as close_error:
+                        # 이미 실패한 뒤의 닫기 에러는 삼켜서 처음 에러가 이기게 해요.
+                        if first_error is None:
+                            first_error = close_error
             if first_error is not None:
-                # 들고 나간 줄을 버퍼 맨 앞에 되돌려서 다음 flush가 먼저 적게 해요.
-                with self._buffer_lock:
-                    self._buffer = lines + self._buffer
+                if not durable:
+                    # 들고 나간 줄을 버퍼 맨 앞에 되돌려서 다음 flush가 먼저 적게 해요.
+                    with self._buffer_lock:
+                        self._buffer = lines + self._buffer
+                # durable이면 닫기만 실패한 거예요. 줄은 이미 fsync로 디스크에 있어서 되돌리지 않아요.
+                # 다시 적으면 앞부분만 적히다 끊겼을 때 새 값 뒤에 옛 값이 남을 수 있어요.
                 self.last_error = first_error
                 raise first_error
             self.last_error = None
