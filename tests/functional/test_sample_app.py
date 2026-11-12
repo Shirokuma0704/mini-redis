@@ -185,3 +185,25 @@ def test_sample_app_점_id는_400_INVALID_ITEM_ID이고_원본_호출도_통계�
     assert response.json()["error"] == "INVALID_ITEM_ID"
     assert origin_calls(origin) == 0
     assert app.get("/stats").json() == {"hits": 0, "misses": 0}
+
+
+@pytest.mark.parametrize("stored_value", ["NaN", "1e999"])
+def test_sample_app_캐시_값이_JSON이지만_렌더할_수_없으면_502_CACHE_ERROR이고_hits는_0(app, cache, stored_value):
+    # NaN/Infinity는 파싱은 되지만 응답으로 내보낼 수 없어서, 500 대신 502로 알려요.
+    cache.put("/keys/item%3A1", json={"value": stored_value, "ttl": 60})
+    response = app.get("/items/1")
+    assert response.status_code == 502
+    assert response.json()["error"] == "CACHE_ERROR"
+    assert app.get("/stats").json() == {"hits": 0, "misses": 0}
+
+
+def test_sample_app_원본이_NaN_본문을_주면_502_ORIGIN_ERROR_캐시에_안_쓰고_misses는_0(cache):
+    origin = mock_client(
+        lambda request: httpx.Response(200, content=b"NaN", headers={"content-type": "application/json"})
+    )
+    app = TestClient(create_sample_app(cache, origin, ttl_s=60))
+    response = app.get("/items/1")
+    assert response.status_code == 502
+    assert response.json()["error"] == "ORIGIN_ERROR"
+    assert cache.get("/keys/item%3A1").status_code == 404
+    assert app.get("/stats").json() == {"hits": 0, "misses": 0}

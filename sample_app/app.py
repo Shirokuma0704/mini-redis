@@ -45,8 +45,10 @@ def create_sample_app(
         if cached.status_code == 200:
             try:
                 body = json.loads(cached.json()["value"])
+                # NaN/Infinity/1e999는 파싱은 되지만 응답으로 렌더할 수 없어서 같이 막아요.
+                json.dumps(body, allow_nan=False)
             except (ValueError, KeyError, TypeError):
-                # 캐시 본문이 JSON이 아니거나 "value"가 없으면 500 대신 502로 알려요.
+                # 캐시 본문이 JSON이 아니거나 "value"가 없거나 렌더할 수 없으면 500 대신 502로 알려요.
                 return error("cache returned an invalid value", "CACHE_ERROR")
             with lock:
                 counters["hits"] += 1
@@ -62,8 +64,10 @@ def create_sample_app(
             return error(f"origin returned {fetched.status_code}", "ORIGIN_ERROR")
         try:
             body = fetched.json()
+            # 렌더할 수 없는 값(NaN 등)은 캐시에 쓰거나 miss로 세기 전에 막아요.
+            json.dumps(body, allow_nan=False)
         except ValueError:
-            return error("origin returned a non-JSON body", "ORIGIN_ERROR")
+            return error("origin returned a non-JSON or unrenderable body", "ORIGIN_ERROR")
 
         try:
             stored = cache.put(
