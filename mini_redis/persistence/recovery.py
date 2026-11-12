@@ -29,33 +29,28 @@ class CorruptAofError(ValueError):
     """끝이 잘린 줄로 볼 수 없는, 진짜로 깨진 AOF 줄을 만났을 때 던져요."""
 
 
-def _apply(state: RecoveredState, record: dict[str, Any], now_ms: int) -> None:
-    """레코드 하나를 반영해요. 모두 대입 연산이라 같은 레코드를 또 적용해도 결과가 같아요."""
+def _apply(state: RecoveredState, record: dict[str, Any]) -> None:
+    """레코드 하나를 반영해요. 모두 대입 연산이라 같은 레코드를 또 적용해도 결과가 같아요.
+
+    여기서는 지금 시각을 보지 않아요. 만료된 값을 중간에 버리면, 나중 EXPIRE가 TTL을 늘렸을 때
+    되살릴 값이 없어지기 때문이에요. 만료 정리는 recover 끝에서 한 번에 해요.
+    """
     op = record["op"]
     if op == "set":
-        exp = record["exp"]
-        if exp is not None and now_ms >= exp:
-            state.table.delete(record["k"])  # 이미 만료된 값은 예전 값도 같이 지워요.
-        else:
-            state.table.put(record["k"], record["v"], exp)
+        state.table.put(record["k"], record["v"], record["exp"])
     elif op == "del":
         state.table.delete(record["k"])
     elif op == "expire":
         entry = state.table.get(record["k"])
-        if entry is None:
-            return
-        exp = record["exp"]
-        if now_ms >= exp:
-            state.table.delete(record["k"])
-        else:
-            state.table.put(record["k"], entry.value, exp)
+        if entry is not None:
+            state.table.put(record["k"], entry.value, record["exp"])
     elif op == "flush":
         state.table = HashTable()  # 버전은 그대로 두고 키만 비워요.
     elif op == "nsver":
         state.versions[record["ns"]] = record["ver"]
 
 
-def _replay_file(state: RecoveredState, path: pathlib.Path, now_ms: int) -> None:
+def _replay_file(state: RecoveredState, path: pathlib.Path) -> None:
     """AOF 파일 하나를 줄 단위로 재생해요. 끝이 잘린 마지막 줄만 버려요."""
     lines = _split_on_newline(path.read_bytes())
     for index, line in enumerate(lines):
@@ -67,7 +62,7 @@ def _replay_file(state: RecoveredState, path: pathlib.Path, now_ms: int) -> None
                 state.dropped_tails += 1  # 쓰다가 죽은 흔적이라 그 줄만 버려요.
                 return
             raise CorruptAofError(f"{path.name} {index + 1}번째 줄이 깨졌어요: {exc}") from exc
-        _apply(state, record, now_ms)
+        _apply(state, record)
 
 
 def _split_on_newline(data: bytes) -> list[bytes]:
@@ -98,12 +93,22 @@ def recover(data_dir: str | os.PathLike[str], now_ms: int) -> RecoveredState:
         # 스냅샷이 깨졌으면 조용히 넘기지 않고 ValueError를 그대로 올려요.
         next_aof_start, records = load_snapshot(snapshot_path)
         for record in records:
-            _apply(state, record, now_ms)
+            _apply(state, record)
 
     numbers = aof_numbers(directory)
     for number in numbers:
         if number >= next_aof_start:  # 더 작은 번호는 이미 스냅샷 안에 들어 있어요.
-            _replay_file(state, directory / aof_name(number), now_ms)
+            _replay_file(state, directory / aof_name(number))
+
+    # 기록을 전부 재생한 뒤에야 지금 시각으로 만료된 키를 한꺼번에 지워요.
+    # 지우는 중에 테이블이 바뀌니까 키를 먼저 모아요.
+    expired = [
+        entry.key
+        for entry in state.table.items()
+        if entry.expire_at_ms is not None and now_ms >= entry.expire_at_ms
+    ]
+    for key in expired:
+        state.table.delete(key)
 
     state.next_aof = max([next_aof_start - 1] + numbers) + 1
     return state

@@ -108,9 +108,10 @@ def test_recover_truncated_tail_in_non_last_file_is_dropped_and_next_file_applie
 
 
 def test_recover_files_are_replayed_in_numeric_order_not_text_order(tmp_path):
-    # 글자 순서로 정렬하면 "10"이 "2"보다 앞서요. 숫자 순서로 읽어야 new가 이겨요.
-    write_aof(tmp_path, 2, set_record("k", "old"))
-    write_aof(tmp_path, 10, set_record("k", "new"))
+    # 글자 순서로 정렬하면 "appendonly-1000000.aof"가 "appendonly-999999.aof"보다 앞서요.
+    # 숫자 순서로 읽어야 나중 번호인 new가 이겨요.
+    write_aof(tmp_path, 999999, set_record("k", "old"))
+    write_aof(tmp_path, 1000000, set_record("k", "new"))
     state = recover(tmp_path, now_ms=1000)
     assert live(state) == [("k", "new", None)]
 
@@ -256,3 +257,45 @@ def test_recover_broken_snapshot_record_propagates_value_error(tmp_path):
     )
     with pytest.raises(ValueError):
         recover(tmp_path, now_ms=1000)
+
+
+# ---- 재생 중엔 만료를 보지 않고, 마지막에 한 번만 걸러요 ----
+# EXPIRE는 원래 만료 시각 전에 실행됐을 수 있어요. 재생 도중에 만료 항목을 버리면
+# 뒤따르는 EXPIRE가 붙을 항목이 없어져서 살아 있어야 할 키가 사라져요.
+
+
+def test_recover_set_then_expire_extending_past_original_exp_keeps_key(tmp_path):
+    write_aof(tmp_path, 1, set_record("k", "v", 5000), expire_record("k", 10000))
+    state = recover(tmp_path, now_ms=6000)
+    assert live(state) == [("k", "v", 10000)]
+
+
+def test_recover_snapshot_set_then_aof_expire_extending_exp_keeps_key(tmp_path):
+    write_snapshot(tmp_path, [("k", "v", 5000)], [], next_aof=1)
+    write_aof(tmp_path, 1, expire_record("k", 10000))
+    state = recover(tmp_path, now_ms=6000)
+    assert live(state) == [("k", "v", 10000)]
+
+
+def test_recover_set_with_past_exp_then_plain_set_keeps_new_value_without_ttl(tmp_path):
+    write_aof(tmp_path, 1, set_record("k", "v", 5000), set_record("k", "w"))
+    state = recover(tmp_path, now_ms=6000)
+    assert live(state) == [("k", "w", None)]
+
+
+def test_recover_expire_shortening_exp_into_the_past_removes_key(tmp_path):
+    write_aof(tmp_path, 1, set_record("k", "v", 10000), expire_record("k", 5000))
+    state = recover(tmp_path, now_ms=6000)
+    assert live(state) == []
+
+
+def test_recover_expire_on_key_deleted_earlier_stays_absent(tmp_path):
+    write_aof(
+        tmp_path,
+        1,
+        set_record("k", "v"),
+        del_record("k"),
+        expire_record("k", 10000),
+    )
+    state = recover(tmp_path, now_ms=6000)
+    assert live(state) == []
