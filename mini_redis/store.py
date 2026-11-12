@@ -44,7 +44,11 @@ def validate_key(key) -> None:
     """키는 비어 있지 않은 문자열이고 UTF-8로 1~256바이트여야 한다."""
     if not isinstance(key, str):
         raise InvalidKey("키는 문자열이어야 합니다")
-    size = len(key.encode("utf-8", errors="surrogatepass"))
+    try:
+        size = len(key.encode("utf-8"))
+    except UnicodeEncodeError:
+        # 외톨이 서로게이트(JSON의 "\ud800" 등)는 UTF-8로 쓸 수 없어 AOF 기록과 JSON 응답이 깨진다
+        raise InvalidKey("키에 UTF-8로 표현할 수 없는 문자가 있습니다")
     if size < 1:
         raise InvalidKey("키는 비어 있을 수 없습니다")
     if size > MAX_KEY_BYTES:
@@ -55,7 +59,11 @@ def validate_value(value) -> None:
     """값은 문자열이고 1MB 이하여야 한다. 빈 문자열은 허용한다."""
     if not isinstance(value, str):
         raise InvalidValue("값은 문자열이어야 합니다")
-    if len(value.encode("utf-8", errors="surrogatepass")) > MAX_VALUE_BYTES:
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise InvalidValue("값에 UTF-8로 표현할 수 없는 문자가 있습니다")
+    if size > MAX_VALUE_BYTES:
         raise ValueTooLarge(f"값은 {MAX_VALUE_BYTES}바이트 이하여야 합니다")
 
 
