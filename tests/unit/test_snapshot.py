@@ -257,3 +257,46 @@ def test_delete_old_aofs_nothing_older_returns_empty_list_and_removes_nothing(tm
     assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
         [aof_name(3), aof_name(4), SNAPSHOT_NAME]
     )
+
+
+# ---- layout: 정식 이름만 AOF로 인정해요 ----
+# 우리 writer는 aof_name(n) 이름만 만들어요. 숫자 표기가 다른 별명(appendonly-1.aof)을 받아 주면
+# 읽는 쪽이 aof_name(n)으로 경로를 다시 만들 때 없는 파일을 찾거나 같은 파일을 두 번 읽게 돼요.
+
+
+def test_aof_numbers_alias_spellings_alone_return_empty_list(tmp_path):
+    _touch(
+        tmp_path,
+        "appendonly-1.aof",
+        "appendonly-0000001.aof",
+        "appendonly-000001.aof.tmp",
+    )
+
+    assert aof_numbers(tmp_path) == []
+
+
+def test_aof_numbers_alias_next_to_canonical_returns_number_once(tmp_path):
+    _touch(tmp_path, "appendonly-1.aof", "appendonly-000001.aof")
+
+    assert aof_numbers(tmp_path) == [1]
+
+
+def test_aof_numbers_directory_with_aof_name_is_ignored(tmp_path):
+    (tmp_path / "appendonly-000002.aof").mkdir()
+    _touch(tmp_path, "appendonly-000003.aof")
+
+    assert aof_numbers(tmp_path) == [3]
+
+
+def test_aof_numbers_seven_digit_canonical_name_is_accepted(tmp_path):
+    _touch(tmp_path, aof_name(1000000))
+
+    assert aof_numbers(tmp_path) == [1000000]
+
+
+def test_delete_old_aofs_alias_file_is_left_untouched_without_error(tmp_path):
+    _touch(tmp_path, "appendonly-000001.aof", "appendonly-2.aof")
+
+    assert delete_old_aofs(tmp_path, 5) == [1]
+    assert (tmp_path / "appendonly-2.aof").exists()
+    assert not (tmp_path / "appendonly-000001.aof").exists()
