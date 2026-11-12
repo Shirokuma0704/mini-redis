@@ -28,11 +28,14 @@ def create_sample_app(
     lock = threading.Lock()
     counters = {"hits": 0, "misses": 0}
 
-    def error(message: str, code: str) -> JSONResponse:
-        return JSONResponse(status_code=502, content={"error": code, "message": message})
+    def error(message: str, code: str, status: int = 502) -> JSONResponse:
+        return JSONResponse(status_code=status, content={"error": code, "message": message})
 
     @app.get("/items/{item_id}")
     def get_item(item_id: str):
+        # "."와 ".."는 httpx가 URL을 합치면서 지워 버려서, 어떤 호출도 하기 전에 막아요.
+        if item_id in (".", ".."):
+            return error("item_id는 '.'나 '..'일 수 없어요", "INVALID_ITEM_ID", 400)
         path = "/keys/" + quote("item:" + item_id, safe="")
         try:
             cached = cache.get(path)
@@ -40,7 +43,11 @@ def create_sample_app(
             return error(f"cache request failed: {exc}", "CACHE_ERROR")
 
         if cached.status_code == 200:
-            body = json.loads(cached.json()["value"])
+            try:
+                body = json.loads(cached.json()["value"])
+            except (ValueError, KeyError, TypeError):
+                # 캐시 본문이 JSON이 아니거나 "value"가 없으면 500 대신 502로 알려요.
+                return error("cache returned an invalid value", "CACHE_ERROR")
             with lock:
                 counters["hits"] += 1
             return JSONResponse(content=body, headers={"X-Cache": "HIT"})
@@ -53,7 +60,10 @@ def create_sample_app(
             return error(f"origin request failed: {exc}", "ORIGIN_ERROR")
         if fetched.status_code != 200:
             return error(f"origin returned {fetched.status_code}", "ORIGIN_ERROR")
-        body = fetched.json()
+        try:
+            body = fetched.json()
+        except ValueError:
+            return error("origin returned a non-JSON body", "ORIGIN_ERROR")
 
         try:
             stored = cache.put(

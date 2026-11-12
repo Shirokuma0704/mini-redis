@@ -159,3 +159,29 @@ def test_sample_app_원본_호출마다_가짜_sleep이_0점2초로_기록돼요
     app.get("/items/2")
     app.get("/items/1")  # HIT이라 원본을 안 불러요
     assert slept == [pytest.approx(0.2), pytest.approx(0.2)]
+
+
+def test_sample_app_캐시에_JSON이_아닌_값이_있으면_502_CACHE_ERROR이고_원본은_안_부름(app, cache, origin):
+    cache.put("/keys/item%3A1", json={"value": "not-json", "ttl": 60})
+    response = app.get("/items/1")
+    assert response.status_code == 502
+    assert response.json()["error"] == "CACHE_ERROR"
+    assert origin_calls(origin) == 0
+
+
+def test_sample_app_원본이_JSON_아닌_200이면_502_ORIGIN_ERROR_캐시에_안_씀(cache):
+    origin = mock_client(lambda request: httpx.Response(200, text="oops", headers={"content-type": "text/plain"}))
+    app = TestClient(create_sample_app(cache, origin, ttl_s=60))
+    response = app.get("/items/1")
+    assert response.status_code == 502
+    assert response.json()["error"] == "ORIGIN_ERROR"
+    assert cache.get("/keys/item%3A1").status_code == 404
+
+
+@pytest.mark.parametrize("item_id", ["%2E", "%2E%2E"])
+def test_sample_app_점_id는_400_INVALID_ITEM_ID이고_원본_호출도_통계도_0(app, origin, item_id):
+    response = app.get("/items/" + item_id)
+    assert response.status_code == 400
+    assert response.json()["error"] == "INVALID_ITEM_ID"
+    assert origin_calls(origin) == 0
+    assert app.get("/stats").json() == {"hits": 0, "misses": 0}
