@@ -25,3 +25,9 @@ AOF_REJECT_AFTER_S = 2  # flush가 이만큼 계속 실패하면 쓰기를 거�
 SNAPSHOT_INTERVAL_S = 300
 SNAPSHOT_AOF_MAX_BYTES = 10 * 1024 * 1024
 DATA_DIR = "data"
+
+# 가짜 원본 API의 고정 지연(ms). 캐시 성능 비교에서 "느린 원본"을 흉내 내요.
+ORIGIN_DELAY_MS = 200
+
+# 샘플 앱이 Mini Redis에 넣는 항목의 TTL(초).
+SAMPLE_CACHE_TTL_S = 60
