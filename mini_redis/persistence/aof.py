@@ -7,50 +7,51 @@
 import json
 import os
 import threading
+from typing import Any
 
 from mini_redis import config
 
 
-def set_record(key, value, expire_at_ms=None):
+def set_record(key: str, value: str, expire_at_ms: int | None = None) -> dict[str, Any]:
     """SET 레코드를 만들어요. expire_at_ms가 None이면 만료 없음이에요."""
     return {"op": "set", "k": key, "v": value, "exp": expire_at_ms}
 
 
-def del_record(key):
+def del_record(key: str) -> dict[str, Any]:
     """DEL 레코드를 만들어요."""
     return {"op": "del", "k": key}
 
 
-def expire_record(key, expire_at_ms):
+def expire_record(key: str, expire_at_ms: int) -> dict[str, Any]:
     """EXPIRE 레코드를 만들어요. 시각은 절대 epoch ms예요."""
     return {"op": "expire", "k": key, "exp": expire_at_ms}
 
 
-def flush_record():
+def flush_record() -> dict[str, Any]:
     """FLUSH 레코드를 만들어요."""
     return {"op": "flush"}
 
 
-def ns_version_record(ns, version):
+def ns_version_record(ns: str, version: int) -> dict[str, Any]:
     """네임스페이스 버전 변경 레코드를 만들어요."""
     return {"op": "nsver", "ns": ns, "ver": version}
 
 
-def encode_record(record):
+def encode_record(record: dict[str, Any]) -> str:
     """레코드를 줄바꿈 하나로 끝나는 한 줄 JSON 문자열로 바꿔요."""
     return json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
 
 
-def _is_str(value):
+def _is_str(value: Any) -> bool:
     return isinstance(value, str)
 
 
-def _is_int(value):
+def _is_int(value: Any) -> bool:
     # bool은 int의 하위 타입이라 따로 걸러내요.
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _is_int_or_none(value):
+def _is_int_or_none(value: Any) -> bool:
     return value is None or _is_int(value)
 
 
@@ -64,7 +65,7 @@ _REQUIRED_FIELDS = {
 }
 
 
-def decode_line(line):
+def decode_line(line: str) -> dict[str, Any]:
     """한 줄을 레코드(dict)로 되돌려요. 깨졌거나 모양이 틀리면 ValueError예요."""
     record = json.loads(line.rstrip("\r\n"))
     if not isinstance(record, dict):
@@ -85,23 +86,27 @@ class AofWriter:
     start()로 켠 스레드가 interval_s마다 flush()를 불러요.
     """
 
-    def __init__(self, path, interval_s=config.AOF_FSYNC_INTERVAL_S):
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        interval_s: float = config.AOF_FSYNC_INTERVAL_S,
+    ) -> None:
         self.path = path
         self._interval_s = interval_s
-        self._buffer = []
+        self._buffer: list[str] = []
         self._buffer_lock = threading.Lock()  # 버퍼를 바꿔 끼울 때만 잡아요.
         self._write_lock = threading.Lock()  # flush끼리 순서가 섞이지 않게 해요.
         self._stop_event = threading.Event()
-        self._thread = None
-        self.last_error = None  # 마지막 flush가 실패했다면 그 예외예요.
+        self._thread: threading.Thread | None = None
+        self.last_error: BaseException | None = None  # 마지막 flush가 실패했다면 그 예외예요.
 
-    def append(self, record):
+    def append(self, record: dict[str, Any]) -> None:
         """레코드를 한 줄로 바꿔 버퍼에 더해요. 파일은 건드리지 않아요."""
         line = encode_record(record)
         with self._buffer_lock:
             self._buffer.append(line)
 
-    def flush(self):
+    def flush(self) -> int:
         """버퍼를 파일에 적고 fsync해요. 적은 줄 수를 돌려줘요."""
         with self._write_lock:
             # 바꿔 끼우는 것도 쓰기 락 안에서 해야 나중 줄이 먼저 적히지 않아요.
@@ -133,7 +138,7 @@ class AofWriter:
             self.last_error = None
             return len(lines)
 
-    def start(self):
+    def start(self) -> None:
         """1초마다 flush하는 데몬 스레드를 켜요. 이미 켜져 있으면 아무것도 안 해요."""
         if self._thread is not None:
             return
@@ -141,7 +146,7 @@ class AofWriter:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def stop(self):
+    def stop(self) -> None:
         """스레드를 멈추고 남은 줄을 마지막으로 flush해요. start 없이 불러도 돼요."""
         self._stop_event.set()
         if self._thread is not None:
@@ -149,7 +154,7 @@ class AofWriter:
             self._thread = None
         self.flush()
 
-    def _run(self):
+    def _run(self) -> None:
         while not self._stop_event.wait(self._interval_s):
             try:
                 self.flush()
