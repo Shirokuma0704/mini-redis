@@ -24,3 +24,6 @@ AOF_FSYNC_INTERVAL_S = 1
 SNAPSHOT_INTERVAL_S = 300
 SNAPSHOT_AOF_MAX_BYTES = 10 * 1024 * 1024
 DATA_DIR = "data"
+
+# 가짜 원본 API의 고정 지연(ms). 캐시 성능 비교에서 "느린 원본"을 흉내 내요.
+ORIGIN_DELAY_MS = 200
