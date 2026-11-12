@@ -16,16 +16,20 @@ from .errors import (
     CapacityExceeded,
     ConfirmRequired,
     EmptyPrefix,
+    GuardRequired,
     InvalidKey,
     InvalidTtl,
     InvalidValue,
     KeyNotFound,
     LeaseInvalid,
     NotInteger,
+    TtlRequired,
     ValueTooLarge,
+    VersionMismatch,
 )
 from .hashtable import HashTable
 from .lease import LeaseTable
+from .namespace import VersionTable
 from .timing_wheel import TimingWheel, start_expiry_thread
 from .xfetch import should_refresh_early
 
@@ -98,6 +102,7 @@ class Item:
     value: str
     expire_at_ms: int | None  # None이면 무기한
     lease: str | None = None  # 값은 있지만 이 요청이 조기 갱신을 맡았다는 표시 (XFetch)
+    version: int | None = None  # ns를 붙여 읽었을 때 그 ns의 현재 버전
 
 
 class Store:
@@ -120,12 +125,25 @@ class Store:
         self._table = HashTable()
         self._wheel = TimingWheel(self._clock())
         self._leases = LeaseTable()
+        self._versions = VersionTable()  # FLUSH에도 유지한다
         self._expiry_stop = None  # 만료 스레드를 멈추는 Event
 
     # --- 내부 도우미 (호출하는 공개 메서드가 락을 이미 잡고 있다) ---
 
     def _now_ms(self) -> int:
         return self._clock()
+
+    def _ns_key(self, key: str, ns: str | None):
+        """키를 검증하고 (내부 키, 버전)을 돌려준다. ns가 있으면 `ns:v{현재 버전}:key`, 없으면 (key, None).
+
+        검증은 사용자가 보낸 키와 ns에 각각 한다 (내부 키는 버전 접두사만큼 길어져 256바이트를 넘을 수 있다).
+        """
+        validate_key(key)
+        if ns is None:
+            return key, None
+        validate_key(ns)
+        version = self._versions.current(ns, self._now_ms())
+        return f"{ns}:v{version}:{key}", version
 
     def _check_capacity(self, key: str) -> None:
         """새 키를 넣을 때만 상한을 검사한다 (덮어쓰기는 키 수가 늘지 않는다)."""
@@ -195,7 +213,15 @@ class Store:
         return self._table.size
 
     @locked
-    def set(self, key: str, value: str, expire_at_ms: int | None = None, lease: str | None = None) -> None:
+    def set(
+        self,
+        key: str,
+        value: str,
+        expire_at_ms: int | None = None,
+        lease: str | None = None,
+        ns: str | None = None,
+        v: int | None = None,
+    ) -> None:
         """키를 저장한다. 이미 있으면 값과 만료 시각을 통째로 교체한다.
 
         expire_at_ms를 안 주면 기존 TTL도 사라진다 (Redis와 동일).
@@ -203,11 +229,29 @@ class Store:
         lease를 주면 그 키의 살아 있는 lease 토큰과 같아야 저장하고 lease를 지운다.
         없거나 만료·무효화됐거나 다르면 LeaseInvalid(409)이고 아무것도 바꾸지 않는다.
         lease 없는 쓰기는 일반 쓰기로 받고, 진행 중인 lease는 무효화한다.
+
+        ns를 주면 `ns:v{현재 버전}:key`에 쓴다. TTL이 없으면 TtlRequired(400), lease도 v도 없으면
+        GuardRequired(400), v가 현재 버전과 다르면 VersionMismatch(409)이고 아무것도 바꾸지 않는다.
         """
-        validate_key(key)
+        key, version = self._ns_key(key, ns)
         validate_value(value)
         if lease is not None and not isinstance(lease, str):
             raise InvalidValue("lease는 문자열이어야 합니다")
+        if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
+            raise InvalidValue("v는 정수여야 합니다")
+        if ns is None:
+            if v is not None:
+                raise InvalidValue("v는 ns와 함께만 쓸 수 있습니다")
+        else:
+            if expire_at_ms is None:
+                # 옛 버전 키는 다시 읽히지 않아서 TTL로만 사라진다
+                raise TtlRequired("ns를 붙인 SET은 ttl이 필요합니다")
+            if lease is None and v is None:
+                # 서버는 도착 시점의 버전으로 키를 바꾸므로, invalidate 전에 읽은 낡은 값이 새 버전 키에 써질 수 있다
+                raise GuardRequired("ns를 붙인 SET은 lease나 읽을 때 받은 버전(v)이 필요합니다")
+            if v is not None and v != version:
+                # 현재 버전은 알려 주지 않는다: 그 버전으로 바로 다시 쓰면 같은 낡은 값이 들어간다. 다시 GET부터 한다
+                raise VersionMismatch(f"읽은 뒤 네임스페이스 '{ns}'가 무효화됐습니다 (v={v}). 다시 GET하세요")
         old = self._get_live(key)  # 같은 키의 만료된 옛 엔트리는 새 키로 취급하려고 먼저 지운다
         self._check_capacity(key)
         delta_ms = None
@@ -226,7 +270,7 @@ class Store:
         self._schedule_expiry(key, old_expire_at_ms, expire_at_ms)
 
     @locked
-    def get(self, key: str, lease: bool = False) -> Item:
+    def get(self, key: str, lease: bool = False, ns: str | None = None) -> Item:
         """없거나 만료됐으면 KeyNotFound(404).
 
         lease=True면 miss일 때 그 404에 새 lease 토큰(`lease`)을 붙인다. 같은 키에 살아 있는
@@ -235,51 +279,60 @@ class Store:
         lease=True이고 값이 있어도, 만료가 가까워 XFetch가 "지금 갱신하라"고 추첨한 요청 하나에는
         값과 함께 lease 토큰을 준다 (Item.lease). 그 클라이언트는 만료 전에 원본을 불러 토큰으로 PUT한다.
         다른 요청은 기다림 없이 평범한 히트를 받는다.
+
+        ns를 주면 `ns:v{현재 버전}:key`를 읽고, 히트(Item.version)와 404(`version`) 모두에 현재 버전을 준다.
+        miss를 받은 클라이언트도 그 버전을 `?v=`로 실어 PUT해야 해서다.
         """
-        validate_key(key)
+        key, version = self._ns_key(key, ns)
         entry = self._get_live(key)
         if entry is not None:
             token = self._early_refresh_lease(key, entry) if lease else None
-            return Item(entry.value, entry.expire_at_ms, token)
-        message = f"키 '{key}'가 없습니다"
-        if not lease:
-            raise KeyNotFound(message)
-        token, retry_after_ms = self._leases.acquire(key, self._now_ms())
-        if token is not None:
-            raise KeyNotFound(message, lease=token)
-        raise KeyNotFound(message, retry_after_ms=retry_after_ms)
+            return Item(entry.value, entry.expire_at_ms, token, version)
+        miss = KeyNotFound(f"키 '{key}'가 없습니다")
+        if version is not None:
+            miss.extra["version"] = version
+        if lease:
+            token, retry_after_ms = self._leases.acquire(key, self._now_ms())
+            if token is not None:
+                miss.extra["lease"] = token
+            else:
+                miss.extra["retry_after_ms"] = retry_after_ms
+        raise miss
 
     @locked
-    def delete(self, key: str) -> bool:
+    def delete(self, key: str, ns: str | None = None) -> bool:
         """지웠으면 True, 원래 없었으면 False (에러 아님, 키가 새로 생기지 않는다).
 
         키가 없어도 lease는 무효화한다. lease 보유자가 원본을 읽는 사이 원본이 바뀌었다는 신호다.
         """
-        validate_key(key)
+        key, _ = self._ns_key(key, ns)
         self._leases.drop(key)
         if self._get_live(key) is None:
             return False
         return self._table.delete(key)
 
     @locked
-    def exists(self, key: str) -> bool:
-        validate_key(key)
+    def exists(self, key: str, ns: str | None = None) -> bool:
+        key, _ = self._ns_key(key, ns)
         return self._get_live(key) is not None
 
     @locked
-    def incr(self, key: str, amount: int = 1) -> int:
+    def incr(self, key: str, amount: int = 1, ns: str | None = None) -> int:
         """값을 10진 정수로 보고 amount만큼 더한 결과를 돌려준다.
 
         - 없는(또는 만료된) 키는 0에서 시작하고 TTL 없는 새 키가 된다.
         - 기존 키의 TTL은 그대로 유지한다 (Redis와 동일).
         - 정수가 아니거나 결과가 64비트를 넘으면 NotInteger(409), 값은 바뀌지 않는다.
+        - ns를 붙였는데 키가 없으면 TtlRequired(400). INCR은 TTL을 줄 수 없어 무기한 키가 생기기 때문이다.
         읽기와 쓰기가 한 번의 락 안에서 일어나서 동시 호출에도 합이 맞는다.
         """
-        validate_key(key)
+        key, _ = self._ns_key(key, ns)
         if isinstance(amount, bool) or not isinstance(amount, int):
             raise InvalidValue("amount는 정수여야 합니다")
         entry = self._get_live(key)
         if entry is None:
+            if ns is not None:
+                raise TtlRequired("ns를 붙인 INCR은 TTL이 있는 기존 키에만 쓸 수 있습니다 (먼저 ttl과 함께 PUT)")
             self._check_capacity(key)
             current, expire_at_ms = 0, None
         else:
@@ -292,14 +345,14 @@ class Store:
         return result
 
     @locked
-    def expire(self, key: str, ttl: int) -> bool:
+    def expire(self, key: str, ttl: int, ns: str | None = None) -> bool:
         """만료를 지금부터 ttl초 뒤로 다시 잡는다. 남은 시간에 더하지 않는다 (Redis와 동일).
 
         - 없는(또는 만료된) 키는 False, 키가 새로 생기지 않는다.
         - ttl이 0 이하면 바로 지우고 True.
         - ttl이 정수가 아니면 InvalidTtl(400).
         """
-        validate_key(key)
+        key, _ = self._ns_key(key, ns)
         if isinstance(ttl, bool) or not isinstance(ttl, int):
             raise InvalidTtl("ttl은 정수(초)여야 합니다")
         entry = self._get_live(key)
@@ -315,12 +368,12 @@ class Store:
         return True
 
     @locked
-    def ttl(self, key: str) -> int:
+    def ttl(self, key: str, ns: str | None = None) -> int:
         """남은 TTL(초). 없거나 만료됐으면 -2, 무기한이면 -1.
 
         남은 ms를 올림한다. GET 응답의 ttl과 같은 숫자가 나오고, 살아 있는 키는 최소 1이다.
         """
-        validate_key(key)
+        key, _ = self._ns_key(key, ns)
         entry = self._get_live(key)
         if entry is None:
             return -2
@@ -354,10 +407,20 @@ class Store:
         return len(victims)
 
     @locked
+    def invalidate(self, ns: str) -> int:
+        """네임스페이스의 버전을 올려 옛 버전 키를 한 번에 안 보이게 한다. 새 버전을 돌려준다. O(1).
+
+        옛 키는 지우지 않고 TTL로 사라진다. 진행 중인 lease도 옛 키에 묶여 있어 그 PUT은 409가 된다.
+        """
+        validate_key(ns)
+        return self._versions.invalidate(ns, self._now_ms())
+
+    @locked
     def flush(self, confirm: bool = False) -> None:
         """모든 키를 지운다. 새 해시테이블·타이밍 휠·lease 테이블로 참조를 바꿔 끼우므로 O(1)이다.
 
         옛 테이블과 휠은 가비지 컬렉터가 치운다. 실수로 호출하지 못하게 confirm=True가 필요하다.
+        버전 테이블은 그대로 둔다(명세). 새로 만들면 시계가 뒤로 갔을 때 버전이 되돌아가 FLUSH 전에 받은 v가 다시 맞을 수 있다.
         """
         if confirm is not True:
             raise ConfirmRequired("FLUSH는 confirm=true가 필요합니다")

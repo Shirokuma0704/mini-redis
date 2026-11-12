@@ -264,20 +264,6 @@ def test_expire_invalid_or_missing_ttl_returns_400_invalid_ttl_and_keeps_key(cli
     assert client.get("/keys/a/ttl").json() == {"ttl": -1}
 
 
-# --- 아직 구현 전인 명령은 조용히 무시하지 않고 거절 ---
-
-
-@pytest.mark.parametrize("url", ["/keys/a?ns=user", "/keys/a?v=7", "/keys/a?ns=user&lease=1"])
-def test_get_with_namespace_returns_501(client, url):
-    assert client.get(url).status_code == 501
-
-
-@pytest.mark.parametrize("url", ["/keys/a?ns=user", "/keys/a?v=7"])
-def test_put_with_namespace_returns_501_and_stores_nothing(client, store, url):
-    assert client.put(url, json={"value": "1", "ttl": 5}).status_code == 501
-    assert store.size() == 0
-
-
 # --- 공통 오류 형식 ---
 
 def test_unknown_route_returns_404_in_error_format(client):

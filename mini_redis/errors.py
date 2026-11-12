@@ -66,8 +66,16 @@ class LeaseInvalid(MiniRedisError):
     code = "LEASE_INVALID"
 
 
-class NotImplementedYet(MiniRedisError):
-    """아직 구현되지 않은 명령 (네임스페이스는 #11)."""
+class TtlRequired(MiniRedisError):
+    status = 400
+    code = "TTL_REQUIRED"
 
-    status = 501
-    code = "NOT_IMPLEMENTED"
+
+class GuardRequired(MiniRedisError):
+    status = 400
+    code = "GUARD_REQUIRED"
+
+
+class VersionMismatch(MiniRedisError):
+    status = 409
+    code = "VERSION_MISMATCH"
