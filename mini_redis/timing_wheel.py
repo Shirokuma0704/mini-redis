@@ -1,6 +1,9 @@
 """계층형 타이밍 휠과 백그라운드 만료 스레드.
 
 1단 64슬롯 x 100ms, 2단 64슬롯 x 6.4초, 그보다 먼 만료는 overflow 최소 힙.
+2단 슬롯 하나는 1단 한 바퀴(64 tick)를 덮으므로 슬롯 안을 tick별 64칸으로 나눠 두고,
+내려보낼 때 같은 번호 칸끼리 list.extend로 붙인다. overflow는 휠 범위에 들어온 항목을
+tick마다 최대 WHEEL_OVERFLOW_MOVE_PER_TICK개씩 옮긴다. 둘 다 tick 하나의 락 점유를 묶으려는 것이다.
 휠 항목은 (key, expire_at_ms) 쌍이다. 꺼낼 때 엔트리의 현재 만료 시각과 다르면
 낡은 항목으로 보고 무시하므로, TTL 갱신, 덮어쓰기, 삭제 때 휠에서 지울 필요가 없다.
 
@@ -22,10 +25,12 @@ from .config import (
     WHEEL_L1_SLOTS,
     WHEEL_L2_MS,
     WHEEL_L2_SLOTS,
+    WHEEL_OVERFLOW_MOVE_PER_TICK,
 )
 
 L2_SPAN = WHEEL_L2_MS // WHEEL_L1_MS  # 2단 슬롯 하나가 덮는 tick 수 (64)
-L2_ROUND = L2_SPAN * WHEEL_L2_SLOTS  # 2단 한 바퀴의 tick 수 (4096)
+# 2단 슬롯의 칸 번호(t % L2_SPAN)를 1단 칸 번호(t % WHEEL_L1_SLOTS)로 그대로 쓰려면 둘이 같아야 한다
+assert L2_SPAN == WHEEL_L1_SLOTS
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +48,7 @@ class TimingWheel:
     def __init__(self, now_ms: int):
         self._tick = now_ms // WHEEL_L1_MS  # 마지막으로 처리한 tick
         self._l1 = [[] for _ in range(WHEEL_L1_SLOTS)]
-        self._l2 = [[] for _ in range(WHEEL_L2_SLOTS)]
+        self._l2 = [[[] for _ in range(L2_SPAN)] for _ in range(WHEEL_L2_SLOTS)]  # [슬롯][t % 64]
         self._overflow = []  # (expire_at_ms, key) 최소 힙
         self._due = []  # 만료됐지만 tick당 상한 때문에 아직 못 꺼낸 항목
 
@@ -55,7 +60,7 @@ class TimingWheel:
         elif t - cur <= WHEEL_L1_SLOTS:
             self._l1[t % WHEEL_L1_SLOTS].append((key, expire_at_ms))
         elif _fits_l2(t, cur):
-            self._l2[t // L2_SPAN % WHEEL_L2_SLOTS].append((key, expire_at_ms))
+            self._l2[t // L2_SPAN % WHEEL_L2_SLOTS][t % L2_SPAN].append((key, expire_at_ms))
         else:
             heapq.heappush(self._overflow, (expire_at_ms, key))
 
@@ -78,17 +83,23 @@ class TimingWheel:
         # ponytail: 빈 tick도 하나씩 돈다. 시계가 며칠씩 앞으로 뛰면 그만큼 락을 오래 잡음, 문제되면 빈 구간 건너뛰기
         while self._tick < target:
             t = self._tick + 1
-            # 내려보낼 항목은 커서가 t-1인 상태에서 다시 넣는다. t에 만료될 항목은 아래에서 바로 꺼낸다.
-            if t % L2_ROUND == 0:
-                # 힙이라 이번 바퀴에 들어올 항목만 꺼내고 나머지는 건드리지 않는다
-                while self._overflow and _fits_l2(_tick_of(self._overflow[0][0]), t - 1):
-                    expire_at_ms, key = heapq.heappop(self._overflow)
-                    self.add(key, expire_at_ms)
+            # 옮기기와 내려보내기는 커서가 t-1인 상태에서 한다. t에 만료될 항목은 아래에서 바로 꺼낸다.
+            # overflow: 힙이라 맨 앞이 가장 이른 만료다. 휠 범위에 들어온 것만 tick당 상한만큼 옮긴다.
+            # 항목은 만료 409.6초 전에 범위에 들어오므로 상한 때문에 늦어져도 만료 전에 휠에 들어간다.
+            for _ in range(WHEEL_OVERFLOW_MOVE_PER_TICK):
+                if not (self._overflow and _fits_l2(_tick_of(self._overflow[0][0]), t - 1)):
+                    break
+                expire_at_ms, key = heapq.heappop(self._overflow)
+                self.add(key, expire_at_ms)
             if t % L2_SPAN == 0:
-                s = t // L2_SPAN % WHEEL_L2_SLOTS
-                items, self._l2[s] = self._l2[s], []
-                for key, expire_at_ms in items:
-                    self.add(key, expire_at_ms)
+                # 불변식: 커서가 t-1이면 1단에는 tick [t, t+63] 항목만 있고(add가 커서+64까지만 1단에 넣음),
+                # 2단 슬롯 s에도 같은 64 tick 항목만 있다(_fits_l2가 다음 64구간만 받아 슬롯이 겹치지 않음).
+                # 그래서 칸 i끼리는 둘 다 tick t+i라 그대로 붙인다.
+                # 항목 수와 상관없이 파이썬 루프는 64번이다.
+                sub = self._l2[t // L2_SPAN % WHEEL_L2_SLOTS]
+                for i in range(L2_SPAN):
+                    self._l1[i].extend(sub[i])
+                    sub[i] = []
             s = t % WHEEL_L1_SLOTS
             self._due.extend(self._l1[s])
             self._l1[s] = []
