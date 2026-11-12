@@ -11,7 +11,7 @@ from fastapi import FastAPI
 DEFAULT_DELAY_MS = 200
 
 
-def create_origin_app(delay_ms=DEFAULT_DELAY_MS, sleep=asyncio.sleep):
+def create_origin_app(delay_ms=DEFAULT_DELAY_MS, sleep=asyncio.sleep) -> FastAPI:
     """가짜 원본 앱을 만들어요. sleep은 테스트에서 가짜로 바꿔 끼울 수 있어요."""
     app = FastAPI()
     app.state.calls = 0

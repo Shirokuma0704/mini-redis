@@ -1,5 +1,6 @@
 """가짜 원본 API(sample_app.origin) 테스트. 실제로 sleep 하지 않고 가짜 sleep을 주입해요."""
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import sample_app.origin as origin
@@ -107,3 +108,4 @@ def test_앱_두개_카운터_서로_분리():
 def test_모듈_기본값_app_존재하고_지연_200ms():
     assert origin.DEFAULT_DELAY_MS == 200
     assert hasattr(origin, "app")
+    assert isinstance(origin.app, FastAPI)
