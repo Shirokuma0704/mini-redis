@@ -256,3 +256,105 @@ def test_items_finished_or_broken_resumes_rehash():
     for _ in range(16):
         t.get("nope")
     assert t._old is None
+
+
+# --- SIEVE 큐와 hand (#25) ---
+
+def queue_keys(t):
+    """FIFO 큐를 꼬리(가장 오래된 것)부터 머리까지."""
+    keys, node = [], t._oldest
+    while node is not None:
+        keys.append(node.key)
+        node = node.newer
+    return keys
+
+
+def evict(t):
+    victim = t.sieve_victim()
+    t.delete(victim.key)
+    return victim.key
+
+
+def test_sieve_victim_empty_table_returns_none():
+    assert HashTable().sieve_victim() is None
+
+
+def test_sieve_queue_put_appends_and_overwrite_keeps_position():
+    t = HashTable()
+    for k in "abc":
+        t.put(k, k)
+    t.put("a", "again")  # 덮어쓰기는 자리를 옮기지 않는다
+    assert queue_keys(t) == ["a", "b", "c"]
+
+
+def test_sieve_victim_skips_visited_clears_bit_and_picks_oldest_unvisited():
+    t = HashTable()
+    for k in "abc":
+        t.put(k, k)
+    t.get("a").visited = True
+    assert evict(t) == "b"
+    assert t.get("a").visited is False  # 한 번 살아남고 비트는 꺼진다
+    assert queue_keys(t) == ["a", "c"]  # 살아남은 엔트리도 자리를 옮기지 않는다
+
+
+def test_sieve_hand_resumes_where_it_stopped_not_from_oldest():
+    t = HashTable()
+    for k in "abcd":
+        t.put(k, k)
+    t.get("a").visited = True
+    assert evict(t) == "b"
+    # a는 이제 꺼져 있고 가장 오래됐지만, hand는 b 다음(c)에서 이어간다 (FIFO와 다른 점)
+    assert evict(t) == "c"
+    assert evict(t) == "d"
+    assert evict(t) == "a"  # 머리를 지나 꼬리로 돌아온다
+
+
+def test_sieve_all_visited_one_lap_clears_all_and_evicts_oldest():
+    t = HashTable()
+    for k in "abc":
+        t.put(k, k)
+        t.get(k).visited = True
+    assert evict(t) == "a"
+    assert [t.get(k).visited for k in "bc"] == [False, False]
+
+
+def test_sieve_delete_hand_entry_moves_hand_to_newer():
+    t = HashTable()
+    for k in "abc":
+        t.put(k, k)
+    t.get("a").visited = True
+    assert t.sieve_victim().key == "b"  # hand가 b에 있다
+    t.delete("b")  # DEL 같은 다른 경로로 지워도
+    t.put("d", "d")
+    assert evict(t) == "c"  # hand는 지운 엔트리 바로 머리 쪽에서 이어간다
+
+
+def test_sieve_delete_hand_at_newest_wraps_to_oldest():
+    t = HashTable()
+    t.put("a", "a")
+    t.put("b", "b")
+    t.get("a").visited = True
+    assert evict(t) == "b"  # 머리를 내보내면 hand는 None
+    t.put("c", "c")
+    assert evict(t) == "a"  # 다음은 꼬리부터
+
+
+def test_sieve_victim_not_deleted_is_picked_again():
+    t = HashTable()
+    for k in "ab":
+        t.put(k, k)
+    assert t.sieve_victim().key == "a"
+    assert t.sieve_victim().key == "a"  # 지우지 못했으면(AOF 실패) 같은 키를 다시 고른다
+
+
+def test_sieve_queue_survives_rehash_and_matches_insertion_order():
+    t = HashTable(rehash_buckets=1)
+    keys = [f"k{i}" for i in range(200)]  # 리사이즈와 점진적 리해싱을 여러 번 거친다
+    for k in keys:
+        t.put(k, k)
+    for k in keys[::3]:
+        t.delete(k)
+    kept = [k for k in keys if k not in keys[::3]]
+    assert queue_keys(t) == kept
+    assert [evict(t) for _ in kept] == kept
+    assert (t.size, t._oldest, t._newest) == (0, None, None)

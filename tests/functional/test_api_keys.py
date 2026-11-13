@@ -128,6 +128,21 @@ def test_put_capacity_exceeded_returns_507(clock):
     assert err(r) == "CAPACITY_EXCEEDED"
 
 
+def test_put_at_capacity_with_sieve_returns_200_and_evicts_unread_key(clock):
+    from fastapi.testclient import TestClient
+
+    from mini_redis.api.app import create_app
+    from mini_redis.store import Store
+
+    c = TestClient(create_app(Store(clock=clock, max_keys=2, eviction="sieve")))
+    c.put("/keys/a", json={"value": "1"})
+    c.put("/keys/b", json={"value": "1"})
+    c.get("/keys/a")
+    r = c.put("/keys/c", json={"value": "1"})
+    assert r.status_code == 200
+    assert c.get("/keys").json() == {"keys": ["a", "c"]}
+
+
 # --- 키 인코딩 ---
 
 @pytest.mark.parametrize(

@@ -3,6 +3,9 @@
 MAX_KEY_BYTES = 256
 MAX_VALUE_BYTES = 1024 * 1024
 MAX_KEYS = 1_000_000
+# 키 상한에서 새 키를 쓸 때: "noeviction"은 507로 거절(명세 기본, Redis maxmemory-policy 기본값과 같다),
+# "sieve"는 SIEVE로 한 키를 내보내고 받는다(#25, 스트레치)
+EVICTION_POLICY = "noeviction"
 
 INITIAL_CAPACITY = 16
 LOAD_FACTOR = 0.75
