@@ -33,9 +33,12 @@ Mini Redis를 앞에 두고 가짜 원본을 감싸는 앱이에요. 캐시에 �
 | --- | --- | --- |
 | `MINI_REDIS_URL` | `http://127.0.0.1:8000` | Mini Redis 주소 |
 | `ORIGIN_URL` | `http://127.0.0.1:8001` | 가짜 원본 주소 |
+| `SAMPLE_USE_CACHE` | (켜짐) | `0`이면 캐시를 끄고 매번 원본을 불러요 |
 
 | 엔드포인트 | 설명 |
 | --- | --- |
 | `GET /items/{item_id}` | 응답 헤더 `X-Cache`가 `HIT`(캐시에서)나 `MISS`(원본에서)예요. 캐시가 고장 나면 `502 CACHE_ERROR`, 원본이 고장 나면 `502 ORIGIN_ERROR`예요. 캐시가 죽었다고 원본으로 몰래 우회하지 않아요. 캐시 값이나 원본 응답이 JSON이 아니어도 500 대신 같은 502예요. `item_id`가 `.`나 `..`이면 호출 없이 `400 INVALID_ITEM_ID`예요. |
 | `GET /stats` | `{"hits": h, "misses": m}`를 돌려줘요. |
 | `POST /stats/reset` | 두 카운터를 0으로 되돌려요. |
+
+`SAMPLE_USE_CACHE=0`으로 띄우면 캐시를 전혀 건드리지 않아요(GET도 PUT도 없어요). 응답 헤더는 `X-Cache: BYPASS`이고 미스로 세어요. `0`이 아닌 값이나 없으면 캐시를 켜요. 캐시가 있을 때와 없을 때를 비교하는 `bench/cache_effect.py`가 이 모드를 써요.
