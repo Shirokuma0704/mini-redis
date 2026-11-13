@@ -3,6 +3,10 @@
 API -> Store -> HashTable 순서로만 호출한다. 락을 잡는 곳은 Store뿐이다.
 공개 메서드는 모두 @locked 로 감싸 명령 하나하나가 원자적이 되게 한다
 (Redis의 명령 직렬 실행과 같은 효과). 디스크 I/O는 절대 락 안에서 하지 않는다.
+
+SIEVE 축출(#25)의 접근: 살아 있는 키의 값을 읽거나 바꾼 명령(GET 히트, SET 덮어쓰기, INCR, EXPIRE)이
+엔트리의 visited를 켠다. EXISTS와 TTL은 있는지·남은 시간만 묻는 명령이라 켜지 않는다(Redis도 이 둘은
+LOOKUP_NOTOUCH로 LRU를 건드리지 않는다). KEYS, 스냅샷 복사도 접근이 아니다.
 """
 import functools
 import random
@@ -11,7 +15,7 @@ import threading
 from dataclasses import dataclass
 
 from .clock import system_clock_ms
-from .config import EXPIRE_TICK_MS, MAX_KEY_BYTES, MAX_KEYS, MAX_VALUE_BYTES, XFETCH_BETA
+from .config import EVICTION_POLICY, EXPIRE_TICK_MS, MAX_KEY_BYTES, MAX_KEYS, MAX_VALUE_BYTES, XFETCH_BETA
 from .errors import (
     CapacityExceeded,
     ConfirmRequired,
@@ -114,14 +118,19 @@ class Store:
         random_fn=random.random,
         xfetch_beta: float = XFETCH_BETA,
         aof=None,
+        eviction: str = EVICTION_POLICY,
     ):
         """clock: epoch ms를 돌려주는 함수. 테스트는 FakeClock을 넣는다.
 
         random_fn: [0, 1) 난수를 돌려주는 함수. XFetch의 조기 갱신 추첨에 쓰며, 테스트는 고정값을 넣는다.
         aof: append(record) 를 가진 객체. None이면 기록하지 않는다.
+        eviction: 키 상한에서 새 키를 쓸 때. "noeviction"은 CapacityExceeded(507), "sieve"는 한 키를 내보낸다.
         """
+        if eviction not in ("noeviction", "sieve"):
+            raise ValueError(f"알 수 없는 축출 정책: {eviction!r}")
         self._clock = clock
         self._max_keys = max_keys
+        self._eviction = eviction
         self._random = random_fn
         self._xfetch_beta = xfetch_beta
         self._lock = threading.RLock()
@@ -158,10 +167,30 @@ class Store:
         if self._aof is not None:
             self._aof.append(record)
 
-    def _check_capacity(self, key: str) -> None:
-        """새 키를 넣을 때만 상한을 검사한다 (덮어쓰기는 키 수가 늘지 않는다)."""
-        if self._table.get(key) is None and self._table.size >= self._max_keys:
+    def _check_capacity(self, key: str) -> bool:
+        """새 키를 넣을 때만 상한을 검사한다 (덮어쓰기는 키 수가 늘지 않는다).
+
+        자리가 없으면 noeviction은 CapacityExceeded(507), sieve는 True를 돌려준다.
+        sieve는 요청이 성공할 게 확실해진 뒤(lease·정수 검사 뒤), 새 키를 기록하기 직전에 _evict를 부른다.
+        거절되는 요청이 키를 내보내지 않게 하려는 것이다.
+        """
+        if self._table.get(key) is not None or self._table.size < self._max_keys:
+            return False
+        if self._eviction == "noeviction":
             raise CapacityExceeded(f"키 개수 상한({self._max_keys})을 초과했습니다")
+        return True
+
+    def _evict(self) -> None:
+        """SIEVE로 고른 키 하나를 내보낸다. 만료 삭제처럼 AOF에 DEL로 먼저 적는다.
+
+        적지 않으면 재시작 때 내보낸 키가 되살아난다. lease는 지우지 않는다: DEL과 달리 원본이 바뀌었다는
+        신호가 아니라서, 진행 중인 lease PUT이 가져올 값은 여전히 최신이다.
+        ponytail: 내보낸 키의 휠 항목은 DEL 때처럼 그대로 두고, 만료 시각에 꺼낼 때 낡은 항목으로 무시된다.
+        축출이 잦고 TTL이 길면 휠 항목 수가 키 상한보다 커질 수 있다. 문제가 되면 휠에 취소 연산을 둔다
+        """
+        victim = self._table.sieve_victim()
+        self._log(del_record(victim.key))
+        self._table.delete(victim.key)
 
     def _schedule_expiry(self, key: str, old_expire_at_ms, new_expire_at_ms) -> None:
         """휠에 (key, 만료 시각)을 등록한다. 낡은 항목이 쌓이지 않게 필요할 때만 add한다.
@@ -244,7 +273,10 @@ class Store:
         if self._aof is not None:
             raise RuntimeError("AOF가 붙은 뒤에는 엔트리를 복원할 수 없어요")
         for key, value, expire_at_ms in entries:
-            self._check_capacity(key)
+            # ponytail: SIEVE 큐는 영속화하지 않는다. 복원한 순서(복구 표의 버킷 순서)로 다시 줄 서고 visited는 모두 꺼진다.
+            # 재시작 직후 축출이 FIFO 대신 해시 순서가 된다. 문제가 되면 스냅샷을 큐 순서로 쓰고 그 순서로 복원한다
+            if self._check_capacity(key):
+                self._evict()  # 상한을 줄여 재시작했을 때. AOF가 없어 기록되지 않는다
             self._table.put(key, value, expire_at_ms)
             self._schedule_expiry(key, None, expire_at_ms)
 
@@ -327,7 +359,7 @@ class Store:
                 # 현재 버전은 알려 주지 않는다: 그 버전으로 바로 다시 쓰면 같은 낡은 값이 들어간다. 다시 GET부터 한다
                 raise VersionMismatch(f"읽은 뒤 네임스페이스 '{ns}'가 무효화됐습니다 (v={v}). 다시 GET하세요")
         old = self._get_live(key)  # 같은 키의 만료된 옛 엔트리는 새 키로 취급하려고 먼저 지운다
-        self._check_capacity(key)
+        evict = self._check_capacity(key)  # noeviction의 507은 lease를 건드리기 전에 낸다
         delta_ms = None
         if lease is None:
             # 늦게 오는 lease PUT이 이 값보다 낡은 원본으로 덮어쓰지 못하게 한다
@@ -340,8 +372,12 @@ class Store:
             # lease 발급부터 PUT까지가 값을 다시 만드는 데 걸린 시간이다 (XFetch의 delta)
             delta_ms = now - issued_at
         old_expire_at_ms = old.expire_at_ms if old is not None else None
+        if evict:
+            self._evict()
         self._log(set_record(key, value, expire_at_ms))
         self._table.put(key, value, expire_at_ms, delta_ms)
+        if old is not None:
+            old.visited = True  # 덮어쓰기는 같은 엔트리를 고친다
         self._schedule_expiry(key, old_expire_at_ms, expire_at_ms)
 
     @locked
@@ -361,6 +397,7 @@ class Store:
         key, version = self._ns_key(key, ns)
         entry = self._get_live(key)
         if entry is not None:
+            entry.visited = True
             token = self._early_refresh_lease(key, entry) if lease else None
             return Item(entry.value, entry.expire_at_ms, token, version)
         miss = KeyNotFound(f"키 '{key}'가 없습니다")
@@ -406,19 +443,24 @@ class Store:
         if isinstance(amount, bool) or not isinstance(amount, int):
             raise InvalidValue("amount는 정수여야 합니다")
         entry = self._get_live(key)
+        evict = False
         if entry is None:
             if ns is not None:
                 raise TtlRequired("ns를 붙인 INCR은 TTL이 있는 기존 키에만 쓸 수 있습니다 (먼저 ttl과 함께 PUT)")
-            self._check_capacity(key)
+            evict = self._check_capacity(key)
             current, expire_at_ms = 0, None
         else:
             current, expire_at_ms = parse_int64(entry.value), entry.expire_at_ms
         result = current + amount
         if not INT64_MIN <= result <= INT64_MAX:
             raise NotInteger("결과가 64비트 정수 범위를 벗어납니다")
+        if evict:
+            self._evict()
         self._log(set_record(key, str(result), expire_at_ms))
         self._leases.drop(key)  # lease 없는 쓰기라 SET과 같이 진행 중인 lease를 무효화한다
         self._table.put(key, str(result), expire_at_ms)
+        if entry is not None:
+            entry.visited = True
         return result
 
     @locked
@@ -443,6 +485,7 @@ class Store:
         new_expire_at_ms = self._now_ms() + ttl * 1000
         self._log(expire_record(key, new_expire_at_ms))
         self._table.put(key, entry.value, new_expire_at_ms, entry.delta_ms)  # 값은 그대로라 delta도 유지
+        entry.visited = True  # 세션의 "활동 시 EXPIRE"처럼 키를 쓰고 있다는 신호다 (Redis EXPIRE도 LRU를 갱신)
         self._schedule_expiry(key, old_expire_at_ms, new_expire_at_ms)
         return True
 
